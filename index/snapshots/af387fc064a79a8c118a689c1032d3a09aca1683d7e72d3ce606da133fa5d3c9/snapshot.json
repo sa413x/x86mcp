@@ -1,0 +1,229 @@
+{
+  "schema_version": 2,
+  "snapshot_id": "af387fc064a79a8c118a689c1032d3a09aca1683d7e72d3ce606da133fa5d3c9",
+  "created_unix_seconds": 1785334248,
+  "build_version": "0.1.0",
+  "ingest_schema_version": 2,
+  "corpus_manifest_blake3": "b87cb1bb70e115ca8e437617312e2a46d1867b468b31d1572f45b65b5e131b77",
+  "archives": [
+    {
+      "id": "amd-apm",
+      "vendor": "amd",
+      "path": "amd-apm-md.zip",
+      "sha256": "eaf3f600e058bcb02a2ced45b1f0ecf8ffcb81dc1980fe59c83e10a9ae1ca79c",
+      "entry_count": 5,
+      "uncompressed_bytes": 10577818
+    },
+    {
+      "id": "intel-sdm",
+      "vendor": "intel",
+      "path": "intel-sdm-md.zip",
+      "sha256": "c7dc09aec070151b607bdbe1ad3d4bbd323c12c8ea68f8c24f7c53341bce785b",
+      "entry_count": 10,
+      "uncompressed_bytes": 17398823
+    }
+  ],
+  "entries": [
+    {
+      "document_id": "doc:0b86e4b459057650301fc47c37bf9f0efe28dd9a18992bd31b543f5b18eedd29",
+      "archive_id": "intel-sdm",
+      "entry_path": "intel-sdm-vol-03b-system-programming-guide-part-2-rev-092-2026-06.md",
+      "sha256": "43c66f7aafeecf18a48f535fb4dec34a3dcca28e13b391f08d43a84b29322c1f",
+      "byte_len": 1675526
+    },
+    {
+      "document_id": "doc:0cef28740e65be3d587f7d30b18b266d20845a698be70005fc8c6f38257e7756",
+      "archive_id": "intel-sdm",
+      "entry_path": "intel-sdm-vol-02c-instruction-set-reference-v-rev-092-2026-06.md",
+      "sha256": "0fade71534feea381fb2efe0f3d0145227dc20730cf1bdae69c194bf252b1f84",
+      "byte_len": 1927038
+    },
+    {
+      "document_id": "doc:0f84059579338e0e8bdbbbab9de995898a07a2db4bc210bf7c0e32e3e7e64e79",
+      "archive_id": "amd-apm",
+      "entry_path": "amd64-apm-vol-05-64-bit-media-and-x87-floating-point-instructions-rev-3.16-2021-11.md",
+      "sha256": "4686a79ca02fc806ca877d7c55765e02cc9e7f292ece416b600b1a5e8241e7bb",
+      "byte_len": 796983
+    },
+    {
+      "document_id": "doc:15b75686fbb29b405251ebfb8f3b5a36b4b9af88519eb29e0430830211bdfd2f",
+      "archive_id": "amd-apm",
+      "entry_path": "amd64-apm-vol-01-application-programming-rev-3.24-2025-08.md",
+      "sha256": "a3e3a8e551d396dd24d5a9dc573534b768ca2ce2ebc30f13abbf0aa27984cdc6",
+      "byte_len": 1128056
+    },
+    {
+      "document_id": "doc:1e6d78bb28d1992bd6aaa474b4bd94ba44d7a835ebb182d46895f7a3cbd8b4d5",
+      "archive_id": "intel-sdm",
+      "entry_path": "intel-sdm-vol-02a-instruction-set-reference-a-l-rev-092-2026-06.md",
+      "sha256": "17eecb4b17c16a607d6b5e68d236ec2d8294cb5aa7dcc0c4cb6b83b0a03ff3e9",
+      "byte_len": 2039321
+    },
+    {
+      "document_id": "doc:2c362caa93febe626a6159d6958e32f7c69060e1ab87518fc660e02a2bd934c1",
+      "archive_id": "amd-apm",
+      "entry_path": "amd64-apm-vol-02-system-programming-rev-3.44-2026-03.md",
+      "sha256": "34f3183127d51c15bb1cc6f9448690185d8234393ad0f3e178c8de3e8f46ac6d",
+      "byte_len": 2502340
+    },
+    {
+      "document_id": "doc:2d2ff4f6568460ec8009072903e7f05cabd7dac59689a262b0a39221b5f777b3",
+      "archive_id": "intel-sdm",
+      "entry_path": "intel-sdm-vol-03a-system-programming-guide-part-1-rev-092-2026-06.md",
+      "sha256": "119cdd05d2f83eab3d4a8648e3fa196a4ff17a5d1f8b8022a904d8bf59dd0bc3",
+      "byte_len": 2080903
+    },
+    {
+      "document_id": "doc:446f2417864c59de4dd271355002229b142a88c90509aedf80058118a309a452",
+      "archive_id": "amd-apm",
+      "entry_path": "amd64-apm-vol-04-128-256-512-bit-media-instructions-rev-3.26-2026-01.md",
+      "sha256": "25281ecacaef0aae23fd0dc4b1c65abb7d88d55e35d90de71b560d4cd3cfdabd",
+      "byte_len": 4794688
+    },
+    {
+      "document_id": "doc:7e9db6b245f0212386877cafb181866237e7776b0e133891fa6b1fa8b6fd5659",
+      "archive_id": "intel-sdm",
+      "entry_path": "intel-sdm-vol-03c-system-programming-guide-part-3-rev-092-2026-06.md",
+      "sha256": "4f3be3dd65794ce197f4b2d464b9e02ca8661fdbf9c7f1fcc521549f7687372c",
+      "byte_len": 1219878
+    },
+    {
+      "document_id": "doc:903acb2945c98f547d8e792ff786fb27fc3761276ec3e50466f8066e5664927b",
+      "archive_id": "intel-sdm",
+      "entry_path": "intel-sdm-vol-02d-instruction-set-reference-w-z-rev-092-2026-06.md",
+      "sha256": "e1c64f0da6090a084314f6cd5c02e862fbbcef619a1f455eeea4780e04c70dc3",
+      "byte_len": 1127315
+    },
+    {
+      "document_id": "doc:91cb24241dbf0bec07fd06842cc1f9102d21be367f11dd1339fd25b3f5dd0089",
+      "archive_id": "intel-sdm",
+      "entry_path": "intel-sdm-vol-04-model-specific-registers-rev-092-2026-06.md",
+      "sha256": "d19b4beedcda39e43566b3223b27292c1c5166c23260d8fd8a0c50cfd8712da7",
+      "byte_len": 2444655
+    },
+    {
+      "document_id": "doc:bcbdb5622b43ebb69454379873ca521d19349115f2a86c95b25142533207b19a",
+      "archive_id": "intel-sdm",
+      "entry_path": "intel-sdm-vol-02b-instruction-set-reference-m-u-rev-092-2026-06.md",
+      "sha256": "d342986edb4ed79563ec080f215b2c501c109cc6c818f348e5cd4ffde3ee0957",
+      "byte_len": 1994807
+    },
+    {
+      "document_id": "doc:cd79747b806029bd57dbee5af0b5e371d5063a95dbe5dc2e7d739042d645eda9",
+      "archive_id": "intel-sdm",
+      "entry_path": "intel-sdm-vol-03d-system-programming-guide-part-4-rev-092-2026-06.md",
+      "sha256": "e2218aeeaa2fd0c8fa221ecf0c16b9fe40288fb298464ee31806bd7c3265ac0f",
+      "byte_len": 759408
+    },
+    {
+      "document_id": "doc:ec2419fcd4c0e50d1f3b5dd558398fc85dc7a3bc88e18288d3bf18a89024a2a8",
+      "archive_id": "intel-sdm",
+      "entry_path": "intel-sdm-vol-01-basic-architecture-rev-092-2026-06.md",
+      "sha256": "cbfabf128da43421af360a12869e004ef051bc75bd9d16f6b72968df608fba5d",
+      "byte_len": 2129972
+    },
+    {
+      "document_id": "doc:f5dd9aaa0a7886826bc80d7425727b6548d139bfa0b0c2dc57ad8d2bd176cab6",
+      "archive_id": "amd-apm",
+      "entry_path": "amd64-apm-vol-03-general-purpose-and-system-instructions-rev-3.37-2025-07.md",
+      "sha256": "395286e9f8d32940d84158063e5274e2ce0e2aece4736823b083560f6c710418",
+      "byte_len": 1355751
+    }
+  ],
+  "catalog_schema_version": 1,
+  "lexical_schema_version": 1,
+  "vector_format_version": 1,
+  "vector_count": 70576,
+  "vector_dimension": 384,
+  "vector_payload_blake3": "c39c3c208d14768f9e0701f34c51661150f9f1e27ae719e85a7fb114af70593a",
+  "model": {
+    "code": "intfloat/multilingual-e5-small",
+    "dimension": 384,
+    "max_tokens": 512,
+    "query_prefix": "query: ",
+    "passage_prefix": "passage: "
+  },
+  "model_artifacts": [
+    {
+      "path": "models--intfloat--multilingual-e5-small/blobs/059214673d9d6d2ee319411e2ffec8c024b816d5.lock",
+      "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    },
+    {
+      "path": "models--intfloat--multilingual-e5-small/blobs/0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39.lock",
+      "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    },
+    {
+      "path": "models--intfloat--multilingual-e5-small/blobs/60a2a84020f1d74cc53ea9e8c4e91cf4af6c2b68.lock",
+      "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    },
+    {
+      "path": "models--intfloat--multilingual-e5-small/blobs/ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665.lock",
+      "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    },
+    {
+      "path": "models--intfloat--multilingual-e5-small/blobs/e0b1d18ecd0ae4ff1d47bd297d910c0cf83e504b.lock",
+      "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    },
+    {
+      "path": "models--intfloat--multilingual-e5-small/refs/main",
+      "blake3": "57e290b12826a1775948eb73721a614095c1968742e92b6910a66c1a71d36c9d"
+    },
+    {
+      "path": "models--intfloat--multilingual-e5-small/snapshots/614241f622f53c4eeff9890bdc4f31cfecc418b3/config.json",
+      "blake3": "008002d237332c95ffe7c26426ce14366bba14b85a7980f9c84992eb2c756242"
+    },
+    {
+      "path": "models--intfloat--multilingual-e5-small/snapshots/614241f622f53c4eeff9890bdc4f31cfecc418b3/onnx/model.onnx",
+      "blake3": "853979ca817e3426bf70a1a2d290292010c9391025adb138eec3b8c26e8c7ba6"
+    },
+    {
+      "path": "models--intfloat--multilingual-e5-small/snapshots/614241f622f53c4eeff9890bdc4f31cfecc418b3/special_tokens_map.json",
+      "blake3": "4a6a3167a6d5c00ed54ae4f7665d487f904befa92585caebbf5c38ac4a38a97e"
+    },
+    {
+      "path": "models--intfloat--multilingual-e5-small/snapshots/614241f622f53c4eeff9890bdc4f31cfecc418b3/tokenizer.json",
+      "blake3": "8e30c0bbbb7ebc0f4b46034ecfcb413f69e2b1c3aef9dfbb421c607f2355bad2"
+    },
+    {
+      "path": "models--intfloat--multilingual-e5-small/snapshots/614241f622f53c4eeff9890bdc4f31cfecc418b3/tokenizer_config.json",
+      "blake3": "40d09ef112877a6ecbd965aa3ce7439187cae2f710d5060e716a91ed6ebc9262"
+    }
+  ],
+  "counts": {
+    "archives": 2,
+    "documents": 15,
+    "sections": 23322,
+    "blocks": 137705,
+    "chunks": 70576,
+    "tables": 8548,
+    "diagrams": 190,
+    "references": 16113,
+    "warnings": 10810,
+    "vectors": 70576
+  },
+  "components": {
+    "catalog": {
+      "raw_bytes": 319758336,
+      "raw_blake3": "ad22247d5fdb0b491f98c3809762312941dc7e6f0b0587c5329b077d8e6d3247",
+      "parts": [
+        {
+          "path": "catalog.sqlite3.zst",
+          "compressed_bytes": 36908115,
+          "compressed_blake3": "3c4aec01a604d838806139777a869bdb1a5db10845bca19acb6218efdc8276d0"
+        }
+      ]
+    },
+    "lexical_blake3": "72fc878999dca44ac93206814c9de39b87e23b8202dacac0cd358c4a6624d4a5",
+    "vectors": {
+      "raw_bytes": 108404800,
+      "raw_blake3": "394a67a14420f8821830e2fdded703396a0598856d121070efea6ceb54127e03",
+      "parts": [
+        {
+          "path": "vectors.f32.zst",
+          "compressed_bytes": 92528622,
+          "compressed_blake3": "ae998abcee56b33efc1c05977dca179cd756aff75d8f544a05195a0746bc9998"
+        }
+      ]
+    }
+  }
+}

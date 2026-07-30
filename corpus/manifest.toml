@@ -1,0 +1,17 @@
+schema_version = 1
+
+[[archives]]
+id = "intel-sdm"
+vendor = "intel"
+path = "intel-sdm-md.zip"
+sha256 = "c7dc09aec070151b607bdbe1ad3d4bbd323c12c8ea68f8c24f7c53341bce785b"
+entry_count = 10
+uncompressed_bytes = 17398823
+
+[[archives]]
+id = "amd-apm"
+vendor = "amd"
+path = "amd-apm-md.zip"
+sha256 = "eaf3f600e058bcb02a2ced45b1f0ecf8ffcb81dc1980fe59c83e10a9ae1ca79c"
+entry_count = 5
+uncompressed_bytes = 10577818

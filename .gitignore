@@ -1,0 +1,5 @@
+/target/
+/docs/intel/
+/docs/amd/
+/index/**/*.sqlite3
+/index/**/*.f32

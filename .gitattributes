@@ -1,0 +1,3 @@
+/corpus/manifest.toml -text
+/index/** -text
+*.sh text eol=lf
