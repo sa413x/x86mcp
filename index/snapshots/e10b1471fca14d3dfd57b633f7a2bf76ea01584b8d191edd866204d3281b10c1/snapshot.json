@@ -1,9 +1,9 @@
 {
   "schema_version": 2,
-  "snapshot_id": "af387fc064a79a8c118a689c1032d3a09aca1683d7e72d3ce606da133fa5d3c9",
-  "created_unix_seconds": 1785334248,
-  "build_version": "0.1.0",
-  "ingest_schema_version": 2,
+  "snapshot_id": "e10b1471fca14d3dfd57b633f7a2bf76ea01584b8d191edd866204d3281b10c1",
+  "created_unix_seconds": 1792621388,
+  "build_version": "0.2.0",
+  "ingest_schema_version": 3,
   "corpus_manifest_blake3": "b87cb1bb70e115ca8e437617312e2a46d1867b468b31d1572f45b65b5e131b77",
   "archives": [
     {
@@ -131,11 +131,11 @@
     }
   ],
   "catalog_schema_version": 1,
-  "lexical_schema_version": 1,
+  "lexical_schema_version": 2,
   "vector_format_version": 1,
-  "vector_count": 70576,
+  "vector_count": 72729,
   "vector_dimension": 384,
-  "vector_payload_blake3": "c39c3c208d14768f9e0701f34c51661150f9f1e27ae719e85a7fb114af70593a",
+  "vector_payload_blake3": "ad405101d713921d98a29184126b43492f19b1d55424dd93c79bd77898cbde5c",
   "model": {
     "code": "intfloat/multilingual-e5-small",
     "dimension": 384,
@@ -144,30 +144,6 @@
     "passage_prefix": "passage: "
   },
   "model_artifacts": [
-    {
-      "path": "models--intfloat--multilingual-e5-small/blobs/059214673d9d6d2ee319411e2ffec8c024b816d5.lock",
-      "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
-    },
-    {
-      "path": "models--intfloat--multilingual-e5-small/blobs/0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39.lock",
-      "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
-    },
-    {
-      "path": "models--intfloat--multilingual-e5-small/blobs/60a2a84020f1d74cc53ea9e8c4e91cf4af6c2b68.lock",
-      "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
-    },
-    {
-      "path": "models--intfloat--multilingual-e5-small/blobs/ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665.lock",
-      "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
-    },
-    {
-      "path": "models--intfloat--multilingual-e5-small/blobs/e0b1d18ecd0ae4ff1d47bd297d910c0cf83e504b.lock",
-      "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
-    },
-    {
-      "path": "models--intfloat--multilingual-e5-small/refs/main",
-      "blake3": "57e290b12826a1775948eb73721a614095c1968742e92b6910a66c1a71d36c9d"
-    },
     {
       "path": "models--intfloat--multilingual-e5-small/snapshots/614241f622f53c4eeff9890bdc4f31cfecc418b3/config.json",
       "blake3": "008002d237332c95ffe7c26426ce14366bba14b85a7980f9c84992eb2c756242"
@@ -192,36 +168,36 @@
   "counts": {
     "archives": 2,
     "documents": 15,
-    "sections": 23322,
-    "blocks": 137705,
-    "chunks": 70576,
-    "tables": 8548,
+    "sections": 23036,
+    "blocks": 137702,
+    "chunks": 72729,
+    "tables": 8945,
     "diagrams": 190,
-    "references": 16113,
-    "warnings": 10810,
-    "vectors": 70576
+    "references": 13590,
+    "warnings": 308,
+    "vectors": 72729
   },
   "components": {
     "catalog": {
-      "raw_bytes": 319758336,
-      "raw_blake3": "ad22247d5fdb0b491f98c3809762312941dc7e6f0b0587c5329b077d8e6d3247",
+      "raw_bytes": 322977792,
+      "raw_blake3": "b3b5212aaea1bfeb5aa047befbb435e802e26bba26834362bae9e1959a041a1f",
       "parts": [
         {
           "path": "catalog.sqlite3.zst",
-          "compressed_bytes": 36908115,
-          "compressed_blake3": "3c4aec01a604d838806139777a869bdb1a5db10845bca19acb6218efdc8276d0"
+          "compressed_bytes": 37203802,
+          "compressed_blake3": "d3d8b775f9d0be0830251c96ba443b5494d6694c3edde94d722940ac74d236b5"
         }
       ]
     },
-    "lexical_blake3": "72fc878999dca44ac93206814c9de39b87e23b8202dacac0cd358c4a6624d4a5",
+    "lexical_blake3": "9eb907485d3a975b9bd70cfc0fc24ce8cd088dc8961a26481501ad4cbd0c7e9a",
     "vectors": {
-      "raw_bytes": 108404800,
-      "raw_blake3": "394a67a14420f8821830e2fdded703396a0598856d121070efea6ceb54127e03",
+      "raw_bytes": 111711808,
+      "raw_blake3": "bed6be83580045bbc5f9fbb0c1914af03487b07c7e64ad41d02a213f5bada504",
       "parts": [
         {
           "path": "vectors.f32.zst",
-          "compressed_bytes": 92528622,
-          "compressed_blake3": "ae998abcee56b33efc1c05977dca179cd756aff75d8f544a05195a0746bc9998"
+          "compressed_bytes": 95906401,
+          "compressed_blake3": "3769f8c5a6bbf91efe9f50a5961408399c9a57703a3289f33c9e0be976d447c5"
         }
       ]
     }

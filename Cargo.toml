@@ -1,6 +1,6 @@
 [package]
 name = "x86mcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Cited Intel SDM and AMD APM retrieval over MCP"
 repository = "https://github.com/sa413x/x86mcp"
