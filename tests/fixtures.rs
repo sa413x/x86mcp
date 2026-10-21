@@ -122,3 +122,57 @@ fn rejects_duplicate_normalized_paths() {
     let error = read_fixture(&fixture).unwrap_err();
     assert!(matches!(error, CorpusError::DuplicatePath { .. }));
 }
+
+/// Rewrites the declared uncompressed size of the archive's only entry (local
+/// header and central directory) and the manifest that pins the archive.
+fn understate_entry_size(fixture: &FixtureCorpus, declared: u32) {
+    let mut archive = fs::read(&fixture.archive_path).unwrap();
+    let patch = |archive: &mut Vec<u8>, signature: &[u8], offset: usize| {
+        let start = archive
+            .windows(signature.len())
+            .position(|window| window == signature)
+            .unwrap();
+        archive[start + offset..start + offset + 4].copy_from_slice(&declared.to_le_bytes());
+    };
+    patch(&mut archive, b"PK\x03\x04", 22);
+    patch(&mut archive, b"PK\x01\x02", 24);
+    let old_sha256 = format!(
+        "{:x}",
+        Sha256::digest(fs::read(&fixture.archive_path).unwrap())
+    );
+    fs::write(&fixture.archive_path, &archive).unwrap();
+    let new_sha256 = format!("{:x}", Sha256::digest(&archive));
+
+    let manifest = fs::read_to_string(&fixture.manifest_path).unwrap();
+    let manifest = manifest
+        .replace(&old_sha256, &new_sha256)
+        .lines()
+        .map(|line| {
+            if line.starts_with("uncompressed_bytes") {
+                format!("uncompressed_bytes = {declared}")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&fixture.manifest_path, manifest).unwrap();
+}
+
+#[test]
+fn rejects_entries_that_inflate_beyond_their_declared_size() {
+    let content = vec![b'A'; 256 * 1024];
+    let fixture = corpus_with_entry("intel", "manual.md", &content);
+    understate_entry_size(&fixture, 16);
+    let error = read_fixture(&fixture).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CorpusError::EntryOverflow {
+                declared_bytes: 16,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}

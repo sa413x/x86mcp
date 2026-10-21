@@ -1,8 +1,10 @@
 mod artifacts;
 mod builder;
+mod lock;
 mod manifest;
 mod opener;
 mod publisher;
+mod status;
 
 use std::{io, path::PathBuf};
 
@@ -16,12 +18,14 @@ use crate::{
 };
 
 pub use builder::SnapshotBuilder;
+pub use lock::IndexLock;
 pub use manifest::{
     ArchiveFingerprint, ComponentChecksums, CompressedArtifact, CompressedPart, EntryFingerprint,
     SNAPSHOT_SCHEMA_VERSION, SnapshotManifest,
 };
 pub use opener::snapshot_status;
 pub use publisher::SnapshotPublisher;
+pub use status::StatusMonitor;
 
 #[derive(Debug, Error)]
 pub enum SnapshotError {
@@ -105,9 +109,24 @@ pub struct SnapshotStatus {
     pub counts: Option<CatalogCounts>,
     pub reasons: Vec<String>,
     pub freshness: Vec<ArchiveFreshness>,
+    /// Why semantic retrieval is unusable (missing or mismatched model artifacts),
+    /// independent of corpus freshness. Empty when semantic retrieval is available.
+    #[serde(default)]
+    pub semantic_degraded_reasons: Vec<String>,
 }
 
 impl SnapshotStatus {
+    fn unusable(state: SnapshotState, reason: String) -> Self {
+        Self {
+            state,
+            snapshot_id: None,
+            counts: None,
+            reasons: vec![reason],
+            freshness: Vec::new(),
+            semantic_degraded_reasons: Vec::new(),
+        }
+    }
+
     pub fn is_usable(&self) -> bool {
         matches!(
             self.state,

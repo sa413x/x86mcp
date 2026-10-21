@@ -11,7 +11,7 @@ use super::{
     IndexError, LexicalHit, LexicalSearchRequest,
     lexical_writer::{kind_key, vendor_key},
     schema::LexicalFields,
-    tokenizer::{normalize_symbol, query_words, register, symbol_terms},
+    tokenizer::{normalize_symbol, register, symbol_terms},
 };
 
 pub struct LexicalSearcher {
@@ -79,17 +79,15 @@ impl LexicalSearcher {
     fn query(&self, request: &LexicalSearchRequest) -> Result<Box<dyn Query>, IndexError> {
         let mut relevance = Vec::<Box<dyn Query>>::new();
         let mut seen_words = HashSet::new();
-        let mut normalized_words = Vec::new();
-        for raw_word in &request.words {
-            for word in query_words(raw_word)? {
-                if seen_words.insert(word.clone()) {
-                    self.add_text_queries(&mut relevance, &word);
-                    normalized_words.push(word);
-                }
+        let mut words = Vec::new();
+        for word in &request.words {
+            if !word.is_empty() && seen_words.insert(word.as_str()) {
+                self.add_text_queries(&mut relevance, word);
+                words.push(word.as_str());
             }
         }
-        if normalized_words.len() >= 2 {
-            self.add_phrase_queries(&mut relevance, &normalized_words);
+        if words.len() >= 2 {
+            self.add_phrase_queries(&mut relevance, &words);
         }
 
         let mut seen_symbols = HashSet::new();
@@ -99,6 +97,9 @@ impl LexicalSearcher {
                 continue;
             }
             relevance.push(boosted_term(self.fields.symbol, &normalized, 8.0));
+            if request.complete_symbols_only {
+                continue;
+            }
             for component in symbol_terms(&normalized).into_iter().skip(1) {
                 relevance.push(boosted_term(self.fields.symbol, &component, 2.0));
             }
@@ -142,7 +143,7 @@ impl LexicalSearcher {
         output.push(boosted_term(self.fields.code, word, 1.2));
     }
 
-    fn add_phrase_queries(&self, output: &mut Vec<Box<dyn Query>>, words: &[String]) {
+    fn add_phrase_queries(&self, output: &mut Vec<Box<dyn Query>>, words: &[&str]) {
         for (field, boost) in [
             (self.fields.heading, 4.5),
             (self.fields.caption, 3.5),

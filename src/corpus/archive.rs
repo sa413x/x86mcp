@@ -51,23 +51,35 @@ pub(crate) fn read_archive(
             });
         }
 
-        let capacity = usize::try_from(entry.size()).map_err(|_| CorpusError::EntryTooLarge {
+        let declared_bytes = entry.size();
+        let capacity = usize::try_from(declared_bytes).map_err(|_| CorpusError::EntryTooLarge {
             archive_id: spec.id.clone(),
             entry_path: entry_path.clone(),
-            bytes: entry.size(),
+            bytes: declared_bytes,
         })?;
+        // The declared size already fits the manifest's remaining budget (checked
+        // above). Inflate at most one byte past it so a lying header cannot make
+        // the reader allocate without bound.
         let mut bytes = Vec::with_capacity(capacity);
-        entry
+        (&mut entry)
+            .take(declared_bytes.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|source| CorpusError::Io {
                 path: archive_path.to_path_buf(),
                 source,
             })?;
-        if bytes.len() as u64 != entry.size() {
+        if bytes.len() as u64 > declared_bytes {
+            return Err(CorpusError::EntryOverflow {
+                archive_id: spec.id.clone(),
+                entry_path,
+                declared_bytes,
+            });
+        }
+        if bytes.len() as u64 != declared_bytes {
             return Err(CorpusError::MetadataMismatch {
                 archive_id: spec.id.clone(),
                 field: "entry_size",
-                expected: entry.size(),
+                expected: declared_bytes,
                 actual: bytes.len() as u64,
             });
         }

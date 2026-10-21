@@ -16,7 +16,7 @@ use crate::{
     domain::{chunk::SearchChunk, document::ArchiveDocument},
     index::{
         Embedder, LEXICAL_SCHEMA_VERSION, LexicalWriter, ModelArtifact, ModelSpec,
-        VECTOR_FORMAT_VERSION, VectorWriter,
+        VECTOR_FORMAT_VERSION, VectorWriter, model_artifacts_match,
     },
     ingest::{
         ChunkConfig, INGEST_SCHEMA_VERSION, ParsedDocument, TokenCounter, chunk_document,
@@ -25,8 +25,8 @@ use crate::{
 };
 
 use super::{
-    ArchiveFingerprint, BuildReport, ComponentChecksums, EntryFingerprint, Snapshot, SnapshotError,
-    SnapshotManifest, SnapshotPublisher,
+    ArchiveFingerprint, BuildReport, ComponentChecksums, EntryFingerprint, IndexLock, Snapshot,
+    SnapshotError, SnapshotManifest, SnapshotPublisher,
     artifacts::compress_artifact,
     manifest::{
         CATALOG_FILE, CATALOG_ZSTD_FILE, LEXICAL_DIR, SNAPSHOT_FILE, SNAPSHOT_SCHEMA_VERSION,
@@ -48,7 +48,11 @@ impl<'a> SnapshotBuilder<'a> {
         Self { config, embedder }
     }
 
+    /// Builds and publishes a snapshot. Unless `force` is set, an up-to-date CURRENT is kept
+    /// and unchanged parsed documents and embeddings are reused from it; `force` rebuilds
+    /// everything and replaces an existing generation with the same ID.
     pub fn build(&self, force: bool) -> Result<BuildReport, SnapshotError> {
+        let lock = IndexLock::acquire(&self.config.index_dir)?;
         let corpus_manifest = CorpusManifest::load(&self.config.corpus_manifest)?;
         let corpus_manifest_blake3 = blake3_file(&self.config.corpus_manifest)?;
         let documents = CorpusReader::new(corpus_manifest.clone(), self.config.corpus_dir.clone())
@@ -86,10 +90,15 @@ impl<'a> SnapshotBuilder<'a> {
             });
         }
 
-        let current = Snapshot::open(&self.config.index_dir, &self.config.snapshot_cache_dir).ok();
-        let vector_source = current
-            .as_ref()
-            .filter(|snapshot| snapshot.manifest.model == *self.embedder.spec());
+        let current = if force {
+            None
+        } else {
+            Snapshot::open(&self.config.index_dir, &self.config.snapshot_cache_dir).ok()
+        };
+        let vector_source = current.as_ref().filter(|snapshot| {
+            snapshot.manifest.model == *self.embedder.spec()
+                && model_artifacts_match(&model_artifacts, &snapshot.manifest.model_artifacts)
+        });
         let current_catalog = current
             .as_ref()
             .filter(|snapshot| snapshot.manifest.ingest_schema_version == INGEST_SCHEMA_VERSION)
@@ -133,8 +142,6 @@ impl<'a> SnapshotBuilder<'a> {
             .collect::<AnyResult<Vec<_>>>()
             .map_err(|error| SnapshotError::Embedding(error.to_string()))?;
 
-        fs::create_dir_all(&self.config.index_dir)
-            .map_err(|source| SnapshotError::io(&self.config.index_dir, source))?;
         let candidate_dir = self.config.index_dir.join(format!(".build-{snapshot_id}"));
         if candidate_dir.exists() {
             fs::remove_dir_all(&candidate_dir)
@@ -233,11 +240,13 @@ impl<'a> SnapshotBuilder<'a> {
             .map_err(|source| SnapshotError::io(&catalog_path, source))?;
         fs::remove_file(&vector_path).map_err(|source| SnapshotError::io(&vector_path, source))?;
         drop(current);
-        SnapshotPublisher::publish(
+        SnapshotPublisher::publish_locked(
+            &lock,
             &self.config.index_dir,
             &candidate_dir,
             &snapshot_id,
             &self.config.snapshot_cache_dir,
+            force,
         )?;
         guard.disarm();
 

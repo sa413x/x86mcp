@@ -14,9 +14,9 @@ use std::{
 use crate::{
     catalog::VectorChunkMetadata,
     domain::{block::SourceBlock, chunk::SearchChunk, citation::Citation},
-    index::{Embedder, FastEmbedder, ModelSpec},
+    index::{Embedder, FastEmbedder, ModelArtifact, ModelSpec, model_artifacts_match},
     ingest::SectionNode,
-    snapshot::{Snapshot, SnapshotState, SnapshotStatus},
+    snapshot::{Snapshot, StatusMonitor},
 };
 
 pub use types::*;
@@ -26,27 +26,19 @@ pub type EmbedderFactory =
 
 pub struct QueryEngine {
     pub(crate) snapshot: Snapshot,
-    pub(crate) status: SnapshotStatus,
+    status: StatusMonitor,
     pub(crate) vector_metadata: Vec<VectorChunkMetadata>,
     metadata_by_chunk: HashMap<String, usize>,
     semantic: SemanticRuntime,
 }
 
 impl QueryEngine {
+    /// `status` re-evaluates the opened snapshot's freshness and model availability on demand.
     pub fn new(
         snapshot: Snapshot,
-        status: SnapshotStatus,
+        status: StatusMonitor,
         semantic_factory: Option<EmbedderFactory>,
     ) -> Result<Self, QueryError> {
-        if status
-            .snapshot_id
-            .as_deref()
-            .is_some_and(|id| id != snapshot.manifest.snapshot_id)
-        {
-            return Err(QueryError::InvalidInput(
-                "status and opened snapshot IDs differ".into(),
-            ));
-        }
         let vector_metadata = snapshot.catalog.vector_metadata()?;
         if vector_metadata.len() as u64 != snapshot.vectors.count()
             || vector_metadata
@@ -74,7 +66,7 @@ impl QueryEngine {
 
     pub fn production(
         snapshot: Snapshot,
-        status: SnapshotStatus,
+        status: StatusMonitor,
         model_cache_dir: PathBuf,
     ) -> Result<Self, QueryError> {
         let factory: EmbedderFactory = Arc::new(move || {
@@ -85,7 +77,7 @@ impl QueryEngine {
 
     pub fn index_status(&self) -> IndexStatusResponse {
         IndexStatusResponse {
-            status: self.status.clone(),
+            status: self.status.evaluate(&self.snapshot.manifest),
             counts: self.snapshot.manifest.counts.clone(),
             manifest: self.snapshot.manifest.clone(),
         }
@@ -94,26 +86,26 @@ impl QueryEngine {
     pub(crate) fn state(&self, semantic_degraded_reason: Option<String>) -> RetrievalState {
         RetrievalState {
             snapshot_id: self.snapshot.manifest.snapshot_id.clone(),
-            stale: self.status.state == SnapshotState::Stale,
+            stale: self.status.is_stale(&self.snapshot.manifest),
             semantic_degraded_reason,
         }
     }
 
     pub(crate) fn base_semantic_degraded_reason(&self) -> Option<String> {
-        (self.status.state == SnapshotState::DegradedModel).then(|| {
-            if self.status.reasons.is_empty() {
-                "semantic model artifacts are unavailable".into()
-            } else {
-                self.status.reasons.join("; ")
-            }
-        })
+        let reasons = self
+            .status
+            .semantic_degraded_reasons(&self.snapshot.manifest);
+        (!reasons.is_empty()).then(|| reasons.join("; "))
     }
 
     pub(crate) fn semantic_embedder(&self) -> Result<Arc<dyn Embedder>, String> {
         if let Some(reason) = self.base_semantic_degraded_reason() {
             return Err(reason);
         }
-        self.semantic.get(&self.snapshot.manifest.model)
+        self.semantic.get(
+            &self.snapshot.manifest.model,
+            &self.snapshot.manifest.model_artifacts,
+        )
     }
 
     pub(crate) fn metadata(&self, chunk_id: &str) -> Option<&VectorChunkMetadata> {
@@ -210,7 +202,11 @@ impl SemanticRuntime {
         }
     }
 
-    fn get(&self, expected: &ModelSpec) -> Result<Arc<dyn Embedder>, String> {
+    fn get(
+        &self,
+        expected: &ModelSpec,
+        expected_artifacts: &[ModelArtifact],
+    ) -> Result<Arc<dyn Embedder>, String> {
         let result = self.initialized.get_or_init(|| {
             let factory = self
                 .factory
@@ -223,6 +219,15 @@ impl SemanticRuntime {
                     expected.code,
                     embedder.spec().code
                 ));
+            }
+            let mut artifacts = embedder
+                .artifact_hashes()
+                .map_err(|error| format!("hashing semantic model artifacts: {error}"))?;
+            artifacts.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+            if !model_artifacts_match(&artifacts, expected_artifacts) {
+                return Err(
+                    "semantic model artifacts differ from those the snapshot was built with".into(),
+                );
             }
             Ok(embedder)
         });

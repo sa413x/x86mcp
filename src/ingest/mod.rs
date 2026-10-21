@@ -18,7 +18,7 @@ pub use markdown::parse_document;
 pub use references::{extract_references, resolve_corpus_references};
 pub use tables::{ExtractedTable, TableError, extract_table};
 
-pub const INGEST_SCHEMA_VERSION: u32 = 2;
+pub const INGEST_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct ParsedDocument {
@@ -200,6 +200,110 @@ mod tests {
         assert_eq!(
             parsed.references[0].target_id.as_deref(),
             Some(parsed.diagrams[0].diagram_id.as_str())
+        );
+    }
+
+    #[test]
+    fn content_takes_the_page_of_the_footer_that_follows_it() {
+        let parsed = parse_document(&document(
+            "# CHAPTER 1 TEST\n\n## 1.1 FIRST\n\nOne.\n\n<page_number>1-1</page_number>\n\n## 1.2 SECOND\n\nTwo.\n\nVol. 1 1-2\n\nAfter the last footer.\n",
+        ))
+        .unwrap();
+        let page = |heading: &str| {
+            parsed
+                .sections
+                .iter()
+                .find(|section| section.heading == heading)
+                .unwrap()
+                .printed_page
+                .clone()
+        };
+        assert_eq!(page("CHAPTER 1 TEST").as_deref(), Some("1-1"));
+        assert_eq!(page("1.1 FIRST").as_deref(), Some("1-1"));
+        assert_eq!(page("1.2 SECOND").as_deref(), Some("1-2"));
+        let trailing = parsed
+            .blocks
+            .iter()
+            .find(|block| block.normalized_text == "After the last footer.")
+            .unwrap();
+        assert_eq!(trailing.span.printed_page, None);
+    }
+
+    #[test]
+    fn running_header_headings_do_not_open_sections() {
+        let parsed = parse_document(&document(
+            "# CHAPTER 5\n# INSTRUCTION SET SUMMARY\n\n## 5.1 GENERAL\n\nFirst page.\n\nVol. 1 5-1\n\n# INSTRUCTION SET SUMMARY\n\nSecond page.\n\n<page_number>2</page_number>\n\n# AMD64 Technology 24592—Rev. 3.24—August 2025\n\nThird page.\n",
+        ))
+        .unwrap();
+        let headings = parsed
+            .sections
+            .iter()
+            .map(|section| section.heading.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            headings,
+            vec!["CHAPTER 5", "INSTRUCTION SET SUMMARY", "5.1 GENERAL"]
+        );
+        for text in ["Second page.", "Third page."] {
+            let block = parsed
+                .blocks
+                .iter()
+                .find(|block| block.normalized_text == text)
+                .unwrap();
+            assert_eq!(
+                block.heading_path.last().map(String::as_str),
+                Some("5.1 GENERAL")
+            );
+            assert_eq!(block.content_class, ContentClass::Substantive);
+        }
+    }
+
+    #[test]
+    fn emphasized_captions_name_their_figure() {
+        let parsed = parse_document(&document(
+            "# CHAPTER 2 MEMORY\n\nSee Figure 2-7.\n\n```mermaid\ngraph TD\nA --> B\n```\n\n**Figure 2-7. Complex Address Calculation**\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed.diagrams[0].caption.as_deref(),
+            Some("Figure 2-7. Complex Address Calculation")
+        );
+        assert_eq!(parsed.references.len(), 1);
+        assert_eq!(
+            parsed.references[0].target_id.as_deref(),
+            Some(parsed.diagrams[0].diagram_id.as_str())
+        );
+    }
+
+    #[test]
+    fn appendix_references_resolve_to_appendix_objects() {
+        let parsed = parse_document(&document(
+            "# APPENDIX B FIELD ENCODING\n\n## B.1 16-BIT FIELDS\n\nSee Table B-1 and Appendix B.1.\n\nTable B-1. Encodings\n\n| Field | Encoding |\n| --- | --- |\n| VPID | 0000H |\n",
+        ))
+        .unwrap();
+        assert_eq!(parsed.references.len(), 2);
+        assert!(parsed.references.iter().all(|reference| reference.resolved));
+        assert_eq!(
+            parsed.references[0].target_id.as_deref(),
+            Some(parsed.tables[0].table_id.as_str())
+        );
+        assert_eq!(
+            parsed.references[1].target_id.as_deref(),
+            Some(parsed.sections[1].section_id.as_str())
+        );
+    }
+
+    #[test]
+    fn a_caption_belongs_only_to_its_adjacent_object() {
+        let parsed = parse_document(&document(
+            "# CHAPTER 1 OVERVIEW\n\n<table><tr><td>RAX</td></tr></table>\n\nFigure 1-1. Registers\n\nSome prose.\n\nTable 1-1. Operating Modes\n\n| Mode | Size |\n| --- | --- |\n| Long | 64 |\n",
+        ))
+        .unwrap();
+        assert_eq!(parsed.tables.len(), 2);
+        assert_eq!(parsed.tables[0].caption, None);
+        assert_eq!(
+            parsed.tables[1].caption.as_deref(),
+            Some("Table 1-1. Operating Modes")
         );
     }
 }

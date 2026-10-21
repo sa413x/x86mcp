@@ -2,7 +2,13 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -10,9 +16,11 @@ use sha2::{Digest, Sha256};
 use x86mcp::{
     config::AppConfig,
     index::{Embedder, FastEmbedder, ModelArtifact, ModelSpec},
+    ingest::INGEST_SCHEMA_VERSION,
+    query::{EmbedderFactory, QueryEngine, SearchMode, SearchRequest},
     snapshot::{
-        SNAPSHOT_SCHEMA_VERSION, Snapshot, SnapshotBuilder, SnapshotError, SnapshotManifest,
-        SnapshotPublisher, SnapshotState, snapshot_status,
+        IndexLock, SNAPSHOT_SCHEMA_VERSION, Snapshot, SnapshotBuilder, SnapshotError,
+        SnapshotManifest, SnapshotPublisher, SnapshotState, StatusMonitor, snapshot_status,
     },
 };
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
@@ -257,8 +265,11 @@ fn ingest_schema_change_invalidates_parsed_document_reuse() {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
 
-    assert_eq!(manifest["ingest_schema_version"].as_u64(), Some(2));
-    manifest["ingest_schema_version"] = serde_json::Value::from(1);
+    assert_eq!(
+        manifest["ingest_schema_version"].as_u64(),
+        Some(u64::from(INGEST_SCHEMA_VERSION))
+    );
+    manifest["ingest_schema_version"] = serde_json::Value::from(INGEST_SCHEMA_VERSION - 1);
     fs::write(
         &manifest_path,
         serde_json::to_vec_pretty(&manifest).unwrap(),
@@ -275,16 +286,193 @@ fn ingest_schema_change_invalidates_parsed_document_reuse() {
     assert!(rebuilt.reused_embeddings > 0);
 }
 
+#[test]
+fn index_lock_serializes_builds() {
+    let temporary = tempfile::tempdir().unwrap();
+    let config = corpus_config(temporary.path());
+    let embedder = FakeEmbedder::new();
+    let first = SnapshotBuilder::new(&config, &embedder)
+        .build(false)
+        .unwrap();
+
+    let held = IndexLock::acquire(&config.index_dir).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let report = SnapshotBuilder::new(&config, &embedder).build(true);
+            sender.send(report).unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(500)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(!has_entry_with_prefix(&config.index_dir, ".build-"));
+
+        drop(held);
+        let report = receiver
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap()
+            .unwrap();
+        assert!(report.built);
+        assert_eq!(report.snapshot_id, first.snapshot_id);
+    });
+    Snapshot::open(&config.index_dir, &config.snapshot_cache_dir).unwrap();
+}
+
+#[test]
+fn vector_reuse_requires_matching_model_artifacts() {
+    let temporary = tempfile::tempdir().unwrap();
+    let config = corpus_config(temporary.path());
+    let original = FakeEmbedder::with_artifacts(vec![fake_artifact("original weights")]);
+    let first = SnapshotBuilder::new(&config, &original)
+        .build(false)
+        .unwrap();
+    assert!(first.embedded_embeddings > 0);
+
+    let retrained = FakeEmbedder::with_artifacts(vec![fake_artifact("retrained weights")]);
+    let second = SnapshotBuilder::new(&config, &retrained)
+        .build(false)
+        .unwrap();
+    assert!(second.built);
+    assert_ne!(second.snapshot_id, first.snapshot_id);
+    assert_eq!(second.reused_embeddings, 0);
+    assert_eq!(second.embedded_embeddings, second.counts.vectors);
+    assert_eq!(second.reused_parsed_documents, 2);
+}
+
+#[test]
+fn force_rebuild_reprocesses_everything_and_replaces_generation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let config = corpus_config(temporary.path());
+    let embedder = FakeEmbedder::new();
+    let first = SnapshotBuilder::new(&config, &embedder)
+        .build(false)
+        .unwrap();
+    let generation = config.index_dir.join("snapshots").join(&first.snapshot_id);
+    fs::write(generation.join("previous-generation-marker"), b"old").unwrap();
+    let calls_before = embedder.calls.load(Ordering::Relaxed);
+
+    let forced = SnapshotBuilder::new(&config, &embedder)
+        .build(true)
+        .unwrap();
+    assert!(forced.built);
+    assert_eq!(forced.snapshot_id, first.snapshot_id);
+    assert_eq!(forced.reused_parsed_documents, 0);
+    assert_eq!(forced.reused_embeddings, 0);
+    assert_eq!(forced.embedded_embeddings, forced.counts.vectors);
+    assert!(embedder.calls.load(Ordering::Relaxed) > calls_before);
+    assert!(!generation.join("previous-generation-marker").exists());
+    assert!(!has_entry_with_prefix(&config.index_dir, ".replaced-"));
+    assert!(!has_entry_with_prefix(&config.index_dir, ".build-"));
+    let reopened = Snapshot::open(&config.index_dir, &config.snapshot_cache_dir).unwrap();
+    assert_eq!(reopened.manifest.snapshot_id, first.snapshot_id);
+}
+
+#[test]
+fn semantic_degradation_is_reported_while_stale() {
+    let temporary = tempfile::tempdir().unwrap();
+    let config = corpus_config(temporary.path());
+    let artifact = install_fake_model(&config, "weights");
+    let model_path = config.model_cache_dir.join(&artifact.path);
+    let embedder = FakeEmbedder::with_artifacts(vec![artifact.clone()]);
+    SnapshotBuilder::new(&config, &embedder)
+        .build(false)
+        .unwrap();
+    let ready = snapshot_status(&config);
+    assert_eq!(ready.state, SnapshotState::Ready);
+    assert!(ready.semantic_degraded_reasons.is_empty());
+
+    fs::remove_file(&model_path).unwrap();
+    fs::write(config.corpus_dir.join("amd.zip"), b"changed archive bytes").unwrap();
+    let status = snapshot_status(&config);
+    assert_eq!(status.state, SnapshotState::Stale);
+    assert!(!status.semantic_degraded_reasons.is_empty());
+
+    let engine = fake_engine(&config, vec![artifact]);
+    let response = engine.search(search("VMX", SearchMode::Semantic)).unwrap();
+    assert!(response.state.stale);
+    assert!(response.state.semantic_degraded_reason.is_some());
+    assert!(response.hits.is_empty());
+    assert!(
+        !engine
+            .index_status()
+            .status
+            .semantic_degraded_reasons
+            .is_empty()
+    );
+}
+
+#[test]
+fn semantic_search_rejects_embedder_with_different_model_artifacts() {
+    let temporary = tempfile::tempdir().unwrap();
+    let config = corpus_config(temporary.path());
+    let embedder =
+        FakeEmbedder::with_artifacts(vec![install_fake_model(&config, "snapshot weights")]);
+    SnapshotBuilder::new(&config, &embedder)
+        .build(false)
+        .unwrap();
+
+    let matching = fake_engine(&config, vec![fake_artifact("snapshot weights")]);
+    let response = matching
+        .search(search("VMX", SearchMode::Semantic))
+        .unwrap();
+    assert!(response.state.semantic_degraded_reason.is_none());
+    assert!(!response.hits.is_empty());
+
+    let mismatched = fake_engine(&config, vec![fake_artifact("other weights")]);
+    let response = mismatched
+        .search(search("VMX", SearchMode::Semantic))
+        .unwrap();
+    assert!(response.state.semantic_degraded_reason.is_some());
+    assert!(response.hits.is_empty());
+}
+
+#[test]
+fn query_engine_status_tracks_corpus_changes_after_start() {
+    let temporary = tempfile::tempdir().unwrap();
+    let config = corpus_config(temporary.path());
+    let embedder = FakeEmbedder::new();
+    SnapshotBuilder::new(&config, &embedder)
+        .build(false)
+        .unwrap();
+    let engine = fake_engine(&config, Vec::new());
+    assert_eq!(engine.index_status().status.state, SnapshotState::Ready);
+    let fresh = engine.search(search("VMX", SearchMode::Lexical)).unwrap();
+    assert!(!fresh.state.stale);
+
+    write_zip(
+        &config.corpus_dir.join("amd.zip"),
+        "amd.md",
+        INTEL_B.as_bytes(),
+    );
+    let status = engine.index_status().status;
+    assert_eq!(status.state, SnapshotState::Stale);
+    assert!(
+        status
+            .freshness
+            .iter()
+            .any(|archive| archive.archive_id == "amd" && !archive.fresh)
+    );
+    let stale = engine.search(search("VMX", SearchMode::Lexical)).unwrap();
+    assert!(stale.state.stale);
+}
+
 struct FakeEmbedder {
     spec: ModelSpec,
     calls: AtomicUsize,
+    artifacts: Vec<ModelArtifact>,
 }
 
 impl FakeEmbedder {
     fn new() -> Self {
+        Self::with_artifacts(Vec::new())
+    }
+
+    fn with_artifacts(artifacts: Vec<ModelArtifact>) -> Self {
         Self {
             spec: FastEmbedder::production_spec().unwrap(),
             calls: AtomicUsize::new(0),
+            artifacts,
         }
     }
 
@@ -318,8 +506,73 @@ impl Embedder for FakeEmbedder {
     }
 
     fn artifact_hashes(&self) -> Result<Vec<ModelArtifact>> {
-        Ok(Vec::new())
+        Ok(self.artifacts.clone())
     }
+}
+
+fn fake_artifact(weights: &str) -> ModelArtifact {
+    ModelArtifact {
+        path: "models--fake--model/snapshots/main/model.onnx".into(),
+        blake3: blake3::hash(weights.as_bytes()).to_hex().to_string(),
+    }
+}
+
+fn install_fake_model(config: &AppConfig, weights: &str) -> ModelArtifact {
+    let artifact = fake_artifact(weights);
+    let path = config.model_cache_dir.join(&artifact.path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, weights).unwrap();
+    artifact
+}
+
+fn fake_engine(config: &AppConfig, artifacts: Vec<ModelArtifact>) -> QueryEngine {
+    let snapshot = Snapshot::open(&config.index_dir, &config.snapshot_cache_dir).unwrap();
+    let factory: EmbedderFactory = Arc::new(move || {
+        Ok(Arc::new(FakeEmbedder::with_artifacts(artifacts.clone())) as Arc<dyn Embedder>)
+    });
+    QueryEngine::new(snapshot, StatusMonitor::new(config), Some(factory)).unwrap()
+}
+
+fn search(query: &str, mode: SearchMode) -> SearchRequest {
+    SearchRequest {
+        query: query.into(),
+        mode,
+        vendors: Vec::new(),
+        document_ids: Vec::new(),
+        kinds: Vec::new(),
+        limit: 10,
+        cursor: None,
+    }
+}
+
+fn corpus_config(root: &Path) -> AppConfig {
+    let corpus_dir = root.join("corpus");
+    let model_cache_dir = root.join("models");
+    fs::create_dir_all(&corpus_dir).unwrap();
+    fs::create_dir_all(&model_cache_dir).unwrap();
+    let intel_path = corpus_dir.join("intel.zip");
+    let amd_path = corpus_dir.join("amd.zip");
+    write_zip(&intel_path, "intel.md", INTEL_A.as_bytes());
+    write_zip(&amd_path, "amd.md", AMD.as_bytes());
+    write_manifest(&corpus_dir, &intel_path, INTEL_A, &amd_path, AMD);
+    AppConfig {
+        root: root.to_path_buf(),
+        corpus_dir: corpus_dir.clone(),
+        corpus_manifest: corpus_dir.join("manifest.toml"),
+        index_dir: root.join("index"),
+        model_cache_dir,
+        snapshot_cache_dir: root.join("snapshot-cache"),
+    }
+}
+
+fn has_entry_with_prefix(directory: &Path, prefix: &str) -> bool {
+    fs::read_dir(directory).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(prefix)
+    })
 }
 
 fn write_manifest(corpus_dir: &Path, intel_path: &Path, intel: &str, amd_path: &Path, amd: &str) {

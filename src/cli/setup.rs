@@ -27,7 +27,19 @@ pub async fn run(config: &AppConfig, options: SetupOptions) -> Result<u8> {
 }
 
 fn setup(config: &AppConfig, options: &SetupOptions) -> Result<SetupReport> {
-    let data = install_data(config, options)?;
+    let (data, (model_artifacts, state)) =
+        install_data(config, options, || verify_installation(config))?;
+    Ok(SetupReport {
+        root: config.root.display().to_string(),
+        data,
+        model_artifacts,
+        state,
+    })
+}
+
+/// Checks the installed data end to end; runs before a replaced installation
+/// is discarded, so every failure here restores the previous installation.
+fn verify_installation(config: &AppConfig) -> Result<(usize, SnapshotState)> {
     let snapshot = Snapshot::open(&config.index_dir, &config.snapshot_cache_dir)
         .context("opening installed snapshot")?;
     let embedder = FastEmbedder::new(config.model_cache_dir.clone())
@@ -43,6 +55,7 @@ fn setup(config: &AppConfig, options: &SetupOptions) -> Result<SetupReport> {
         model_artifacts_match(&model_artifacts, &snapshot.manifest.model_artifacts),
         "embedding model artifacts do not match the installed snapshot"
     );
+    drop(snapshot);
 
     let status = snapshot_status(config);
     ensure!(
@@ -50,10 +63,5 @@ fn setup(config: &AppConfig, options: &SetupOptions) -> Result<SetupReport> {
         "installed snapshot is not ready: {}",
         status.reasons.join("; ")
     );
-    Ok(SetupReport {
-        root: config.root.display().to_string(),
-        data,
-        model_artifacts: model_artifacts.len(),
-        state: status.state,
-    })
+    Ok((model_artifacts.len(), status.state))
 }

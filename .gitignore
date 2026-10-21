@@ -3,3 +3,4 @@
 /docs/amd/
 /index/**/*.sqlite3
 /index/**/*.f32
+/.x86mcp-index.lock

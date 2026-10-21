@@ -9,8 +9,8 @@ use super::{
     diagrams::extract_diagram,
     headings::HeadingBuilder,
     normalize::{
-        HeadingDisposition, classify_body, classify_heading, extract_printed_page, is_page_marker,
-        normalize_markdown,
+        HeadingDisposition, chapter_title, classify_body, classify_heading, extract_printed_page,
+        is_page_marker, normalize_markdown,
     },
     references::{extract_references, resolve_document_references},
     tables::extract_table,
@@ -49,6 +49,8 @@ pub fn parse_document(document: &ArchiveDocument) -> Result<ParsedDocument, Inge
     let mut page_markers = Vec::new();
     let mut known_headings = Vec::new();
     let mut inherited_class = ContentClass::FrontMatter;
+    let mut current_chapter_title = None::<String>;
+    let mut chapter_title_pending = false;
     let mut line_index = 0_usize;
 
     while line_index < index.lines.len() {
@@ -59,10 +61,20 @@ pub fn parse_document(document: &ArchiveDocument) -> Result<ParsedDocument, Inge
 
         if let Some((source_level, heading)) = parse_atx_heading(index.text(line_index)) {
             let span = index.span(line_index, line_index);
-            let disposition = classify_heading(&heading, sections.is_empty());
+            let disposition = classify_heading(
+                &heading,
+                sections.is_empty(),
+                current_chapter_title.as_deref(),
+            );
             let (section_id, heading_path, content_class) = match disposition {
                 HeadingDisposition::Section => {
                     inherited_class = ContentClass::Substantive;
+                    if let Some(title) = chapter_title(&heading) {
+                        chapter_title_pending = title.is_empty();
+                        current_chapter_title = Some(normalize_markdown(&title));
+                    } else if std::mem::take(&mut chapter_title_pending) {
+                        current_chapter_title = Some(normalize_markdown(&heading));
+                    }
                     let section = headings.push(
                         &document.meta.document_id,
                         source_level,
@@ -79,6 +91,10 @@ pub fn parse_document(document: &ArchiveDocument) -> Result<ParsedDocument, Inge
                     inherited_class = class;
                     let (section_id, heading_path) = current_section(&headings, &front_section_id);
                     (section_id, heading_path, class)
+                }
+                HeadingDisposition::PageFurniture => {
+                    let (section_id, heading_path) = current_section(&headings, &front_section_id);
+                    (section_id, heading_path, ContentClass::PageFurniture)
                 }
             };
             blocks.push(make_block(
@@ -357,18 +373,47 @@ pub fn parse_document(document: &ArchiveDocument) -> Result<ParsedDocument, Inge
     })
 }
 
+/// The caption adjacent to a table or diagram in the same section. The search
+/// in each direction skips page furniture and prose but stops at the first
+/// caption, table or diagram, so one object cannot claim another's caption.
 fn nearest_caption(blocks: &[SourceBlock], position: usize, prefix: &str) -> Option<String> {
     let section_id = &blocks[position].section_id;
-    blocks
-        .iter()
-        .enumerate()
-        .filter(|(_, block)| {
-            block.kind == BlockKind::Caption
-                && block.section_id == *section_id
-                && block.normalized_text.starts_with(prefix)
-        })
-        .min_by_key(|(candidate, _)| candidate.abs_diff(position))
-        .map(|(_, block)| block.normalized_text.clone())
+    let before = adjacent_caption(blocks[..position].iter().rev(), section_id, prefix);
+    let after = adjacent_caption(blocks[position + 1..].iter(), section_id, prefix);
+    let nearest = match (before, after) {
+        (Some(before), Some(after)) if after.0 < before.0 => Some(after),
+        (Some(before), _) => Some(before),
+        (None, after) => after,
+    };
+    nearest.map(|(_, caption)| caption.to_owned())
+}
+
+/// The distance to and text of the first caption in `candidates`, if it has
+/// `prefix` and no table or diagram comes before it.
+fn adjacent_caption<'a>(
+    candidates: impl Iterator<Item = &'a SourceBlock>,
+    section_id: &str,
+    prefix: &str,
+) -> Option<(usize, &'a str)> {
+    for (distance, block) in candidates.enumerate() {
+        if block.section_id != section_id {
+            return None;
+        }
+        if block.content_class == ContentClass::PageFurniture {
+            continue;
+        }
+        match block.kind {
+            BlockKind::Caption => {
+                return block
+                    .normalized_text
+                    .starts_with(prefix)
+                    .then_some((distance, block.normalized_text.as_str()));
+            }
+            BlockKind::Table | BlockKind::Diagram => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -484,13 +529,12 @@ fn finalize_sections(
     }
 }
 
+/// The manuals print page numbers in page footers, so content belongs to the
+/// page whose marker follows it. Content after the last marker sits on an
+/// unnumbered page.
 fn page_for(byte_start: u64, markers: &[PageMarker]) -> Option<String> {
-    markers
-        .iter()
-        .rev()
-        .find(|marker| marker.byte_start <= byte_start)
-        .or_else(|| markers.first())
-        .map(|marker| marker.page.clone())
+    let position = markers.partition_point(|marker| marker.byte_start < byte_start);
+    markers.get(position).map(|marker| marker.page.clone())
 }
 
 fn parse_atx_heading(line: &str) -> Option<(u8, String)> {
@@ -566,7 +610,10 @@ fn is_list_start(line: &str) -> bool {
 }
 
 fn is_caption(line: &str) -> bool {
-    let trimmed = line.trim_start();
+    let trimmed = line
+        .trim_start()
+        .trim_start_matches(['*', '_'])
+        .trim_start();
     ["Figure ", "Table ", "Рисунок ", "Таблица "]
         .iter()
         .any(|prefix| trimmed.starts_with(prefix))

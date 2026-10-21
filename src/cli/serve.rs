@@ -6,13 +6,14 @@ use crate::{
     config::AppConfig,
     mcp,
     query::QueryEngine,
-    snapshot::{Snapshot, snapshot_status},
+    snapshot::{Snapshot, StatusMonitor},
 };
 
 pub async fn run(config: &AppConfig) -> Result<u8> {
-    let status = snapshot_status(config);
-    if !status.is_usable() {
-        bail!("no usable index snapshot: {}", status.reasons.join("; "));
+    let status = StatusMonitor::new(config);
+    let startup = status.current_status();
+    if !startup.is_usable() {
+        bail!("no usable index snapshot: {}", startup.reasons.join("; "));
     }
     let snapshot = Snapshot::open(&config.index_dir, &config.snapshot_cache_dir)
         .context("opening current index snapshot")?;

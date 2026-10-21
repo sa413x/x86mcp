@@ -469,12 +469,12 @@ fn trailing_overlap(
 }
 
 fn render_table(headers: &[String], rows: &[Vec<String>]) -> String {
-    let mut text = headers.join(" | ");
-    for row in rows {
-        text.push('\n');
-        text.push_str(&row.join(" | "));
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    if headers.iter().any(|header| !header.is_empty()) {
+        lines.push(headers.join(" | "));
     }
-    text
+    lines.extend(rows.iter().map(|row| row.join(" | ")));
+    lines.join("\n")
 }
 
 fn strip_code_fence(raw: &str) -> &str {
@@ -652,6 +652,28 @@ mod tests {
                 .all(|chunk| chunk.text.contains("Bit | Meaning"))
         );
         assert!(tables.iter().all(|chunk| chunk.token_count <= 7));
+    }
+
+    #[test]
+    fn headerless_html_table_rows_are_chunked() {
+        let document = document(
+            "<table>\n<tr><td>JNO</td><td>Jump if not overflow.</td></tr>\n<tr><td>JS</td><td>Jump if sign (negative).</td></tr>\n</table>\n",
+        );
+        let parsed = parse_document(&document).unwrap();
+        assert!(parsed.warnings.is_empty());
+        let chunks = chunk_document(
+            &document,
+            &parsed,
+            &WhitespaceCounter,
+            ChunkConfig::default(),
+        )
+        .unwrap();
+        let table = chunks
+            .iter()
+            .find(|chunk| chunk.kind == ChunkKind::Table)
+            .unwrap();
+        assert!(table.text.contains("JNO | Jump if not overflow."));
+        assert!(table.text.contains("JS | Jump if sign (negative)."));
     }
 
     #[test]

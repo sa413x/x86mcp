@@ -1,14 +1,20 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::catalog::{SectionView, TablePage};
+use crate::{
+    catalog::{SectionView, TablePage},
+    domain::chunk::SearchChunk,
+};
 
 use super::{
     EntityKind, EntityState, GetDiagramRequest, GetDiagramResponse, GetOutlineRequest,
     GetOutlineResponse, GetReferencesRequest, GetReferencesResponse, GetSectionRequest,
     GetSectionResponse, GetTableRequest, GetTableResponse, LookupRequest, LookupResponse,
-    QueryEngine, QueryError, SearchMode, SearchRequest, SectionNeighbors,
+    QueryEngine, QueryError, SearchHit, SearchMode, SearchRequest, SectionNeighbors,
     planner::{next_page_cursor, page_offset},
 };
+
+/// Page size used while scanning exact-symbol candidates for kind-qualified evidence.
+const EXACT_SCAN_PAGE: u32 = 50;
 
 impl QueryEngine {
     pub fn lookup(&self, request: LookupRequest) -> Result<LookupResponse, QueryError> {
@@ -22,44 +28,88 @@ impl QueryEngine {
                 "lookup limit must be between 1 and 25".into(),
             ));
         }
-        let search = |mode| {
+        let limit = request.limit as usize;
+        let search = |mode, limit, cursor| {
             self.search(SearchRequest {
                 query: request.entity.clone(),
                 mode,
                 vendors: request.vendors.clone(),
                 document_ids: Vec::new(),
                 kinds: Vec::new(),
-                limit: request.limit,
-                cursor: None,
+                limit,
+                cursor,
             })
         };
-        let exact_response = if request.kind == EntityKind::Term {
-            None
-        } else {
-            Some(search(SearchMode::Exact)?)
-        };
-        let exact_truncated = exact_response.as_ref().is_some_and(|response| {
-            response.next_cursor.is_some() || response.candidate_window_truncated
-        });
-        let exact = exact_response
-            .map(|response| response.hits)
-            .unwrap_or_default();
-        let exact_ids = exact
-            .iter()
-            .map(|hit| hit.chunk_id.as_str())
-            .collect::<HashSet<_>>();
-        let related_response = search(SearchMode::Lexical)?;
-        let related_truncated =
+        // Exact-symbol hits only count as exact evidence when the chunk carries a
+        // signal for the requested kind; the rest are demoted to related evidence.
+        let mut exact = Vec::new();
+        let mut mismatched = Vec::new();
+        let mut exact_truncated = false;
+        if request.kind != EntityKind::Term {
+            let mut cursor = None;
+            loop {
+                let response = search(SearchMode::Exact, EXACT_SCAN_PAGE, cursor)?;
+                let ids = response
+                    .hits
+                    .iter()
+                    .map(|hit| hit.chunk_id.clone())
+                    .collect::<Vec<_>>();
+                let chunks = self
+                    .snapshot
+                    .catalog
+                    .chunks_by_ids(&ids)?
+                    .into_iter()
+                    .map(|chunk| (chunk.chunk_id.clone(), chunk))
+                    .collect::<HashMap<_, _>>();
+                for hit in response.hits {
+                    let qualified = chunks
+                        .get(&hit.chunk_id)
+                        .is_some_and(|chunk| kind_matches(request.kind, &request.entity, chunk));
+                    if !qualified {
+                        mismatched.push(hit);
+                    } else if exact.len() < limit {
+                        exact.push(hit);
+                    } else {
+                        exact_truncated = true;
+                    }
+                }
+                match response.next_cursor {
+                    Some(next) if !exact_truncated => cursor = Some(next),
+                    _ => {
+                        exact_truncated |= response.candidate_window_truncated;
+                        break;
+                    }
+                }
+            }
+        }
+        let related_response = search(SearchMode::Lexical, request.limit, None)?;
+        let mut related_truncated =
             related_response.next_cursor.is_some() || related_response.candidate_window_truncated;
-        let related = related_response
-            .hits
-            .into_iter()
-            .filter(|hit| !exact_ids.contains(hit.chunk_id.as_str()))
-            .collect::<Vec<_>>();
-        let entity_state = if exact.is_empty() && related.is_empty() {
-            EntityState::NotFound
+        let mut seen = exact
+            .iter()
+            .chain(&mismatched)
+            .map(|hit| hit.chunk_id.clone())
+            .collect::<HashSet<_>>();
+        let mut related: Vec<SearchHit> = mismatched;
+        related.extend(
+            related_response
+                .hits
+                .into_iter()
+                .filter(|hit| seen.insert(hit.chunk_id.clone())),
+        );
+        if related.len() > limit {
+            related.truncate(limit);
+            related_truncated = true;
+        }
+        let found = if request.kind == EntityKind::Term {
+            !related.is_empty()
         } else {
+            !exact.is_empty()
+        };
+        let entity_state = if found {
             EntityState::Found
+        } else {
+            EntityState::NotFound
         };
         Ok(LookupResponse {
             state: self.state(None),
@@ -410,6 +460,7 @@ impl QueryEngine {
             limit,
             has_more: end < rows.len(),
             raw_source: first.raw_source,
+            warnings: first.warnings,
         }))
     }
 
@@ -424,6 +475,288 @@ impl QueryEngine {
         }
         Ok(false)
     }
+}
+
+/// Decides whether an exact-symbol hit is evidence for `entity` as the requested `kind`.
+///
+/// Every typed kind first requires the chunk to name the entity. Kinds whose names follow
+/// architectural conventions (`IA32_*` MSRs, `#GP` exceptions, `CR4` registers, `CR4.VMXE`
+/// bitfields, `CPUID.01H` leaves) qualify by that shape; other names qualify only when a
+/// heading, line, or sentence pairs the entity with a kind marker. Instructions require an
+/// instruction-reference heading that begins with the mnemonic (`MOV—Move`, `VMRUN Run
+/// Virtual Machine`).
+fn kind_matches(kind: EntityKind, entity: &str, chunk: &SearchChunk) -> bool {
+    let entity = entity.trim();
+    if kind == EntityKind::Term {
+        return true;
+    }
+    let segments = evidence_segments(chunk);
+    let normalized = crate::index::normalize_symbol(entity);
+    let mentioned = segments
+        .iter()
+        .any(|segment| contains_token(segment, entity))
+        || chunk
+            .symbols
+            .iter()
+            .any(|symbol| crate::index::normalize_symbol(symbol) == normalized);
+    if !mentioned {
+        return false;
+    }
+    match kind {
+        EntityKind::Term => true,
+        EntityKind::Instruction => {
+            is_mnemonic(entity)
+                && chunk
+                    .heading_path
+                    .iter()
+                    .any(|heading| heading_names_instruction(heading, entity))
+        }
+        EntityKind::Msr => {
+            is_msr_name(entity)
+                || co_occurs(
+                    &segments,
+                    entity,
+                    &[
+                        "MSR",
+                        "MSRs",
+                        "model-specific register",
+                        "model specific register",
+                    ],
+                )
+        }
+        EntityKind::Cpuid => {
+            if is_cpuid_reference(entity) {
+                segments
+                    .iter()
+                    .any(|segment| contains_token(segment, "CPUID"))
+            } else {
+                co_occurs(&segments, entity, &["CPUID"])
+            }
+        }
+        EntityKind::Register => {
+            is_register_name(entity) || co_occurs(&segments, entity, &["register", "registers"])
+        }
+        EntityKind::Exception => {
+            is_exception_mnemonic(entity)
+                || co_occurs(
+                    &segments,
+                    entity,
+                    &[
+                        "exception",
+                        "exceptions",
+                        "fault",
+                        "trap",
+                        "abort",
+                        "interrupt",
+                    ],
+                )
+        }
+        EntityKind::Bitfield => {
+            is_bitfield_reference(entity)
+                || co_occurs(
+                    &segments,
+                    entity,
+                    &["bit", "bits", "flag", "flags", "field", "fields"],
+                )
+        }
+    }
+}
+
+/// Headings plus the lines and sentences of the chunk text.
+fn evidence_segments(chunk: &SearchChunk) -> Vec<&str> {
+    chunk
+        .heading_path
+        .iter()
+        .map(String::as_str)
+        .chain(chunk.text.lines().flat_map(|line| line.split(". ")))
+        .filter(|segment| !segment.trim().is_empty())
+        .collect()
+}
+
+fn co_occurs(segments: &[&str], entity: &str, markers: &[&str]) -> bool {
+    segments.iter().any(|segment| {
+        contains_token(segment, entity)
+            && markers.iter().any(|marker| contains_token(segment, marker))
+    })
+}
+
+/// ASCII case-insensitive search for `needle` delimited by non-identifier characters.
+fn contains_token(haystack: &str, needle: &str) -> bool {
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    let (Some(&first), Some(&last)) = (needle.first(), needle.last()) else {
+        return false;
+    };
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    (0..=haystack.len() - needle.len()).any(|start| {
+        let end = start + needle.len();
+        haystack[start..end].eq_ignore_ascii_case(needle)
+            && (!is_identifier_byte(first)
+                || start == 0
+                || !is_identifier_byte(haystack[start - 1]))
+            && (!is_identifier_byte(last)
+                || haystack
+                    .get(end)
+                    .is_none_or(|&byte| !is_identifier_byte(byte)))
+    })
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// One or more `/`-separated mnemonics such as `CVTSI2SD`, `Jcc`, or `MOVS/MOVSB`.
+fn is_mnemonic(entity: &str) -> bool {
+    entity.split('/').all(|part| {
+        part.len() <= 24
+            && part.starts_with(|character: char| character.is_ascii_alphabetic())
+            && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            && !is_register_name(part)
+    })
+}
+
+/// True for unnumbered instruction-reference headings whose leading mnemonic list
+/// (`MOVSX/MOVSXD—Move With Sign-Extension`, `VMRUN Run Virtual Machine`) names `entity`.
+fn heading_names_instruction(heading: &str, entity: &str) -> bool {
+    let heading = heading.trim();
+    if heading.starts_with(|character: char| character.is_ascii_digit()) {
+        return false;
+    }
+    let lead = heading
+        .split(|character: char| {
+            character.is_whitespace() || matches!(character, '—' | '–' | '-' | '(' | ',' | ':')
+        })
+        .next()
+        .unwrap_or_default();
+    let mnemonics = lead.split('/').collect::<Vec<_>>();
+    mnemonics
+        .iter()
+        .all(|mnemonic| is_reference_mnemonic(mnemonic))
+        && entity.split('/').all(|part| {
+            mnemonics
+                .iter()
+                .any(|mnemonic| mnemonic.eq_ignore_ascii_case(part))
+        })
+}
+
+/// Manual spelling of a mnemonic: upper-case, optionally ending in a short lower-case
+/// operand placeholder (`CMOVcc`, `Jcc`, `PREFETCHh`).
+fn is_reference_mnemonic(mnemonic: &str) -> bool {
+    let trimmed = mnemonic.trim_end_matches(|character: char| character.is_ascii_lowercase());
+    mnemonic.len() - trimmed.len() <= 2
+        && trimmed.starts_with(|character: char| character.is_ascii_uppercase())
+        && trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn is_msr_name(entity: &str) -> bool {
+    let upper = entity.to_ascii_uppercase();
+    upper.starts_with("IA32_") || upper.starts_with("MSR_") || is_hex_address(&upper)
+}
+
+/// Hexadecimal MSR addresses or CPUID leaves: `C000_0080h`, `0xC0000080`, `174H`.
+fn is_hex_address(upper: &str) -> bool {
+    let (digits, marked) = if let Some(digits) = upper.strip_prefix("0X") {
+        (digits, true)
+    } else if let Some(digits) = upper.strip_suffix('H') {
+        let marked = digits.contains('_') || digits.starts_with(|c: char| c.is_ascii_digit());
+        (digits, marked)
+    } else {
+        (upper, upper.contains('_'))
+    };
+    let hex = digits.bytes().filter(|byte| *byte != b'_').count();
+    marked
+        && (1..=8).contains(&hex)
+        && !digits.starts_with('_')
+        && digits
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'_')
+}
+
+fn is_cpuid_reference(entity: &str) -> bool {
+    let upper = entity.to_ascii_uppercase();
+    if let Some(rest) = upper.strip_prefix("CPUID") {
+        return !rest.starts_with(|character: char| character.is_ascii_alphanumeric());
+    }
+    if let Some(rest) = upper.strip_prefix("FN") {
+        return rest.starts_with(|character: char| character.is_ascii_hexdigit())
+            && rest
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    }
+    is_hex_address(&upper)
+}
+
+fn is_register_name(entity: &str) -> bool {
+    const NAMED: &[&str] = &[
+        "RFLAGS", "EFLAGS", "FLAGS", "RIP", "EIP", "IP", "EFER", "MXCSR", "GDTR", "IDTR", "LDTR",
+        "TR", "CS", "DS", "ES", "FS", "GS", "SS", "PKRU", "TPR", "SSP", "RAX", "EAX", "AX", "AL",
+        "AH", "RBX", "EBX", "BX", "BL", "BH", "RCX", "ECX", "CX", "CL", "CH", "RDX", "EDX", "DX",
+        "DL", "DH", "RSI", "ESI", "SI", "SIL", "RDI", "EDI", "DI", "DIL", "RSP", "ESP", "SP",
+        "SPL", "RBP", "EBP", "BP", "BPL",
+    ];
+    const NUMBERED: &[(&str, &[&str])] = &[
+        ("CR", &[""]),
+        ("DR", &[""]),
+        ("XCR", &[""]),
+        ("XMM", &[""]),
+        ("YMM", &[""]),
+        ("ZMM", &[""]),
+        ("TMM", &[""]),
+        ("MM", &[""]),
+        ("ST", &[""]),
+        ("K", &[""]),
+        ("BND", &[""]),
+        ("R", &["", "D", "W", "B", "L"]),
+    ];
+    let upper = entity.to_ascii_uppercase();
+    if NAMED.contains(&upper.as_str()) {
+        return true;
+    }
+    let upper = upper.replace(['(', ')'], "");
+    NUMBERED.iter().any(|(prefix, suffixes)| {
+        upper.strip_prefix(prefix).is_some_and(|rest| {
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            digits > 0 && suffixes.contains(&&rest[digits..])
+        })
+    })
+}
+
+/// Architectural exception mnemonics such as `#GP`, `#PF`, or `#GP(0)`.
+fn is_exception_mnemonic(entity: &str) -> bool {
+    let Some(rest) = entity.strip_prefix('#') else {
+        return false;
+    };
+    let (name, error_code) = rest.split_once('(').unwrap_or((rest, ""));
+    name.len() == 2
+        && name.bytes().all(|byte| byte.is_ascii_alphabetic())
+        && (error_code.is_empty() || error_code.ends_with(')'))
+}
+
+/// `REG.FIELD` or `REG[bits]` references such as `CR4.VMXE`, `IA32_EFER.LME`, or `CR3[51:12]`.
+fn is_bitfield_reference(entity: &str) -> bool {
+    let upper = entity.trim().to_ascii_uppercase();
+    if upper.starts_with("CPUID") {
+        return upper
+            .split_once(':')
+            .is_some_and(|(_, output)| output.contains(['.', '[']));
+    }
+    let split = upper.find(['.', '[']);
+    let Some(index) = split else {
+        return false;
+    };
+    let (register, field) = upper.split_at(index);
+    let valid_register = register.starts_with(|character: char| character.is_ascii_alphabetic())
+        && register.bytes().all(is_identifier_byte);
+    let field = &field[1..];
+    valid_register
+        && if upper.as_bytes()[index] == b'[' {
+            field.len() > 1 && field.ends_with(']')
+        } else {
+            field.starts_with(|character: char| character.is_ascii_alphanumeric())
+        }
 }
 
 fn section_neighbors(
@@ -493,4 +826,106 @@ where
         None
     };
     Ok((selected, next))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::domain::{
+        Vendor,
+        block::ContentClass,
+        chunk::{ChunkKind, SearchChunk},
+        source::SourceSpan,
+    };
+
+    use super::{EntityKind, kind_matches};
+
+    fn chunk(heading_path: &[&str], text: &str) -> SearchChunk {
+        SearchChunk {
+            chunk_id: "chk:test".into(),
+            document_id: "doc:test".into(),
+            section_id: "sec:test".into(),
+            vendor: Vendor::Intel,
+            heading_path: heading_path
+                .iter()
+                .map(|&heading| heading.to_owned())
+                .collect(),
+            source_block_ids: Vec::new(),
+            kind: ChunkKind::Prose,
+            content_class: ContentClass::Substantive,
+            text: text.into(),
+            token_count: 1,
+            content_hash: String::new(),
+            symbols: Vec::new(),
+            span: SourceSpan {
+                byte_start: 0,
+                byte_end: 1,
+                line_start: 1,
+                line_end: 1,
+                printed_page: None,
+            },
+        }
+    }
+
+    #[test]
+    fn instruction_kind_requires_an_instruction_reference_heading() {
+        let intel = chunk(
+            &["MOVSX/MOVSXD—Move With Sign-Extension", "Description"],
+            "MOVSXD sign-extends a doubleword.",
+        );
+        let amd = chunk(
+            &["VMRUN Run Virtual Machine"],
+            "VMRUN starts a guest. It uses the VM_HSAVE_PA MSR.",
+        );
+        let msr = chunk(
+            &["IA32_EFER Extended Feature Enable Register"],
+            "IA32_EFER is a model-specific register.",
+        );
+        let chapter = chunk(
+            &["15 Secure Virtual Machine", "15.5 VMRUN Instruction"],
+            "VMRUN is described here.",
+        );
+        assert!(kind_matches(EntityKind::Instruction, "MOVSXD", &intel));
+        assert!(kind_matches(EntityKind::Instruction, "vmrun", &amd));
+        assert!(!kind_matches(EntityKind::Instruction, "IA32_EFER", &msr));
+        assert!(!kind_matches(EntityKind::Instruction, "VMRUN", &chapter));
+        assert!(!kind_matches(EntityKind::Msr, "VMRUN", &amd));
+    }
+
+    #[test]
+    fn typed_kinds_accept_conventional_names_and_marker_co_occurrence() {
+        let msr = chunk(
+            &["Architectural MSRs"],
+            "EFER (MSR C000_0080h) enables long mode. Set CR4.VMXE before VMXON. #GP(0) is raised otherwise. CPUID.01H:ECX.VMX[bit 5] reports VMX support.",
+        );
+        assert!(kind_matches(
+            EntityKind::Msr,
+            "IA32_EFER",
+            &chunk(&[], "IA32_EFER")
+        ));
+        assert!(kind_matches(EntityKind::Msr, "C000_0080h", &msr));
+        assert!(kind_matches(EntityKind::Msr, "EFER", &msr));
+        assert!(kind_matches(EntityKind::Register, "EFER", &msr));
+        assert!(kind_matches(EntityKind::Register, "CR4", &msr));
+        assert!(!kind_matches(EntityKind::Instruction, "CR4", &msr));
+        assert!(kind_matches(EntityKind::Bitfield, "CR4.VMXE", &msr));
+        assert!(!kind_matches(EntityKind::Bitfield, "CR4", &msr));
+        assert!(kind_matches(EntityKind::Exception, "#GP(0)", &msr));
+        assert!(!kind_matches(EntityKind::Exception, "CR4.VMXE", &msr));
+        assert!(kind_matches(
+            EntityKind::Cpuid,
+            "CPUID.01H:ECX.VMX[bit 5]",
+            &msr
+        ));
+        assert!(kind_matches(
+            EntityKind::Bitfield,
+            "CPUID.01H:ECX.VMX[bit 5]",
+            &msr
+        ));
+        assert!(!kind_matches(
+            EntityKind::Cpuid,
+            "C000_0080h",
+            &chunk(&[], "C000_0080h")
+        ));
+        assert!(!kind_matches(EntityKind::Msr, "IA32_EFER", &msr));
+    }
 }

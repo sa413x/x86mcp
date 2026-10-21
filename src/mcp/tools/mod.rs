@@ -47,7 +47,7 @@ impl X86McpServer {
 
     #[tool(
         name = "x86_lookup",
-        description = "Look up a typed x86 entity such as an instruction, MSR, CPUID leaf, register, exception, bitfield, or term. Returns exact and related cited evidence with explicit not-found and truncation state.",
+        description = "Look up a typed x86 entity such as an instruction, MSR, CPUID leaf, register, exception, bitfield, or term. Exact-symbol hits are returned as exact evidence only when they match the requested kind (instruction: reference heading begins with the mnemonic; msr: IA32_*/MSR_* name, hex address, or MSR mention; cpuid: CPUID leaf reference with CPUID mention; register: architectural register name or register mention; exception: #XX mnemonic or exception mention; bitfield: REG.FIELD/REG[bits] or bit/flag/field mention); mismatched hits are reported as related. entity_state is found only with kind-matched exact evidence, except term, which is lexical only. Returns cited evidence with truncation state.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -81,7 +81,7 @@ impl X86McpServer {
 
     #[tool(
         name = "x86_get_outline",
-        description = "List documents or walk a document section hierarchy from an optional root, with bounded depth, stable IDs, citations, and cursor pagination.",
+        description = "List documents or walk a document section hierarchy from an optional root, with bounded depth, stable IDs, per-section source citations, and cursor pagination.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -98,7 +98,7 @@ impl X86McpServer {
 
     #[tool(
         name = "x86_get_table",
-        description = "Retrieve a normalized Intel or AMD manual table by table ID or containing block ID. Supports row filtering and offset pagination while preserving raw source and extraction warnings.",
+        description = "Retrieve a normalized Intel or AMD manual table by table ID or containing block ID. Supports row filtering and offset pagination while preserving raw source and persisted extraction warnings.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -132,7 +132,7 @@ impl X86McpServer {
 
     #[tool(
         name = "x86_get_references",
-        description = "Traverse resolved and unresolved manual cross-references incoming to or outgoing from a block, section, document, table, or diagram ID. Reports ambiguity and whether more results exist.",
+        description = "Traverse resolved and unresolved manual cross-references incoming to or outgoing from a block, section, document, table, or diagram ID; table and diagram IDs and their containing block IDs are interchangeable. Each reference carries a source citation. Reports ambiguity and whether more results exist.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -166,7 +166,7 @@ impl X86McpServer {
 
     #[tool(
         name = "x86_build_context",
-        description = "Assemble a citation-preserving, token-budgeted context pack from a query and/or explicit chunk IDs. Merges only adjacent source chunks and reports every budget omission.",
+        description = "Assemble a citation-preserving, token-budgeted context pack from a query and/or explicit chunk IDs. The vendors filter applies to both. Merges only adjacent source chunks and reports every omission (missing ID, excluded vendor, or exhausted budget).",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

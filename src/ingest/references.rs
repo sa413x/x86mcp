@@ -8,6 +8,10 @@ use crate::domain::{
 };
 
 use super::{ExtractedDiagram, ExtractedTable, ParsedDocument, SectionNode};
+
+/// Manual object labels: `26.8`, `2-48`, `A`, `A.3.1`, `B-1`.
+const LABEL: &str = r"(?:[A-Z]|\d+)(?:\.\d+)*(?:-\d+)?";
+
 pub fn extract_references(block: &SourceBlock) -> Vec<ReferenceRecord> {
     if block.kind == BlockKind::Caption
         || block
@@ -18,9 +22,9 @@ pub fn extract_references(block: &SourceBlock) -> Vec<ReferenceRecord> {
         return Vec::new();
     }
     static REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"(?i)\b(?P<kind>Section|Chapter|Appendix|Table|Figure)\s+(?P<label>[A-Z]|\d+(?:\.\d+)*(?:-\d+)?)",
-        )
+        Regex::new(&format!(
+            r"\b(?P<kind>(?i:section|chapter|appendix|table|figure))\s+(?P<label>{LABEL})\b"
+        ))
         .expect("manual-reference regex must compile")
     });
 
@@ -29,28 +33,17 @@ pub fn extract_references(block: &SourceBlock) -> Vec<ReferenceRecord> {
         .filter_map(|captures| {
             let matched = captures.get(0)?;
             let kind_name = captures.name("kind")?.as_str().to_ascii_lowercase();
-            let value = captures.name("label")?.as_str();
+            let value = captures.name("label")?.as_str().to_ascii_lowercase();
             let (kind, normalized_key) = match kind_name.as_str() {
-                "table" => (
-                    ReferenceKind::Table,
-                    format!("table:{}", value.to_ascii_lowercase()),
-                ),
-                "figure" => (
-                    ReferenceKind::Figure,
-                    format!("figure:{}", value.to_ascii_lowercase()),
-                ),
-                "chapter" => (
-                    ReferenceKind::Section,
-                    format!("chapter:{}", value.to_ascii_lowercase()),
-                ),
-                "appendix" => (
-                    ReferenceKind::Section,
-                    format!("appendix:{}", value.to_ascii_lowercase()),
-                ),
-                _ => (
-                    ReferenceKind::Section,
-                    format!("section:{}", value.to_ascii_lowercase()),
-                ),
+                "table" => (ReferenceKind::Table, format!("table:{value}")),
+                "figure" => (ReferenceKind::Figure, format!("figure:{value}")),
+                // `Appendix A.3` and `Chapter 5.2` name numbered sections.
+                "chapter" | "appendix" if value.contains('.') => {
+                    (ReferenceKind::Section, format!("section:{value}"))
+                }
+                "chapter" => (ReferenceKind::Section, format!("chapter:{value}")),
+                "appendix" => (ReferenceKind::Section, format!("appendix:{value}")),
+                _ => (ReferenceKind::Section, format!("section:{value}")),
             };
             let identity = format!(
                 "{}\0{}\0{}\0{}",
@@ -189,28 +182,31 @@ fn declarations(
 
 fn section_key(heading: &str) -> Option<String> {
     static HEADING: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)^\s*(?:(?P<kind>CHAPTER|APPENDIX)\s+)?(?P<label>[A-Z]|\d+(?:\.\d+)*)\b")
-            .expect("section declaration regex must compile")
+        Regex::new(
+            r"^\s*(?:(?i:chapter)\s*(?P<chapter>\d+)|(?i:appendix)\s+(?P<appendix>[A-Z])\b|(?P<section>(?:[A-Z]|\d+)(?:\.\d+)+|\d+)\b)",
+        )
+        .expect("section declaration regex must compile")
     });
     let captures = HEADING.captures(heading)?;
-    let label = captures.name("label")?.as_str().to_ascii_lowercase();
-    Some(
-        match captures
-            .name("kind")
-            .map(|kind| kind.as_str().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("chapter") => format!("chapter:{label}"),
-            Some("appendix") => format!("appendix:{label}"),
-            _ => format!("section:{label}"),
-        },
-    )
+    if let Some(chapter) = captures.name("chapter") {
+        return Some(format!("chapter:{}", chapter.as_str()));
+    }
+    if let Some(appendix) = captures.name("appendix") {
+        return Some(format!(
+            "appendix:{}",
+            appendix.as_str().to_ascii_lowercase()
+        ));
+    }
+    let section = captures.name("section")?.as_str().to_ascii_lowercase();
+    Some(format!("section:{section}"))
 }
 
 fn caption_key(caption: &str, expected_kind: &str) -> Option<String> {
     static CAPTION: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)^\s*(?P<kind>Table|Figure)\s+(?P<label>\d+(?:\.\d+)*(?:-\d+)?)\b")
-            .expect("caption declaration regex must compile")
+        Regex::new(&format!(
+            r"^\s*(?P<kind>(?i:table|figure))\s+(?P<label>{LABEL})\b"
+        ))
+        .expect("caption declaration regex must compile")
     });
     let captures = CAPTION.captures(caption)?;
     let kind = captures.name("kind")?.as_str().to_ascii_lowercase();
@@ -234,7 +230,21 @@ mod tests {
         source::SourceSpan,
     };
 
-    use super::extract_references;
+    use super::{caption_key, extract_references, section_key};
+
+    fn prose(text: &str) -> SourceBlock {
+        SourceBlock {
+            block_id: "blk:refs".into(),
+            document_id: "doc:test".into(),
+            section_id: "sec:test".into(),
+            kind: BlockKind::Prose,
+            heading_path: vec!["APPENDIX A".into()],
+            raw_source: text.into(),
+            normalized_text: text.into(),
+            content_class: ContentClass::Substantive,
+            span: SourceSpan::default(),
+        }
+    }
 
     #[test]
     fn extracts_typed_unresolved_manual_references() {
@@ -260,5 +270,52 @@ mod tests {
         assert_eq!(references[3].kind, ReferenceKind::Section);
         assert!(!references[0].resolved);
         assert!(references[0].candidates.is_empty());
+    }
+
+    #[test]
+    fn appendix_labels_keep_their_full_alphanumeric_form() {
+        let references = extract_references(&prose(
+            "See Table B-1, Figure A-2, Appendix A.3, Section A.3.1, and Appendix C; the table below is unrelated.",
+        ));
+        let keys = references
+            .iter()
+            .map(|reference| reference.normalized_key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                "table:b-1",
+                "figure:a-2",
+                "section:a.3",
+                "section:a.3.1",
+                "appendix:c"
+            ]
+        );
+    }
+
+    #[test]
+    fn appendix_declarations_match_reference_keys() {
+        assert_eq!(
+            caption_key("Table B-1. Operations and Operands", "table").as_deref(),
+            Some("table:b-1")
+        );
+        assert_eq!(
+            caption_key("Figure A-2. Layout", "figure").as_deref(),
+            Some("figure:a-2")
+        );
+        assert_eq!(
+            section_key("A.3.1 Pin-Based VM-Execution Controls").as_deref(),
+            Some("section:a.3.1")
+        );
+        assert_eq!(
+            section_key("A.3 VM-EXECUTION CONTROLS").as_deref(),
+            Some("section:a.3")
+        );
+        assert_eq!(section_key("APPENDIX A").as_deref(), Some("appendix:a"));
+        assert_eq!(
+            section_key("CHAPTER 1ABOUT THIS MANUAL").as_deref(),
+            Some("chapter:1")
+        );
+        assert_eq!(section_key("A Note on Terms"), None);
     }
 }

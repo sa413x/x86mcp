@@ -192,6 +192,7 @@ impl QueryEngine {
                             base.words.clone()
                         },
                         exact_symbols: base.exact_symbols.clone(),
+                        complete_symbols_only: exact_only,
                         vendor: vendor.copied(),
                         document_id: document.map(|value| value.to_owned()),
                         kind: kind.copied(),

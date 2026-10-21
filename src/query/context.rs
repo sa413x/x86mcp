@@ -7,6 +7,9 @@ use super::{
     QueryError, SearchRequest,
 };
 
+/// Maximum chunk IDs loaded from the catalog per call.
+const CATALOG_CHUNK_BATCH_SIZE: usize = 256;
+
 impl QueryEngine {
     pub fn build_context(
         &self,
@@ -61,21 +64,29 @@ impl QueryEngine {
             }
         }
 
-        let chunks = self
-            .snapshot
-            .catalog
-            .chunks_by_ids(&ordered_ids)?
-            .into_iter()
-            .map(|chunk| (chunk.chunk_id.clone(), chunk))
-            .collect::<HashMap<_, _>>();
-        let mut omissions = ordered_ids
-            .iter()
-            .filter(|chunk_id| !chunks.contains_key(*chunk_id))
-            .map(|chunk_id| ContextOmission {
+        let mut chunks = HashMap::with_capacity(ordered_ids.len());
+        for batch in ordered_ids.chunks(CATALOG_CHUNK_BATCH_SIZE) {
+            for chunk in self.snapshot.catalog.chunks_by_ids(batch)? {
+                chunks.insert(chunk.chunk_id.clone(), chunk);
+            }
+        }
+        let mut omissions = Vec::new();
+        ordered_ids.retain(|chunk_id| {
+            let reason = match chunks.get(chunk_id) {
+                None => "chunk ID was not found in the current snapshot",
+                Some(chunk)
+                    if !request.vendors.is_empty() && !request.vendors.contains(&chunk.vendor) =>
+                {
+                    "chunk vendor is excluded by the vendors filter"
+                }
+                Some(_) => return true,
+            };
+            omissions.push(ContextOmission {
                 chunk_id: chunk_id.clone(),
-                reason: "chunk ID was not found in the current snapshot".into(),
-            })
-            .collect::<Vec<_>>();
+                reason: reason.into(),
+            });
+            false
+        });
         let groups = adjacent_groups(
             ordered_ids
                 .iter()

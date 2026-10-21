@@ -42,8 +42,12 @@ pub enum IndexError {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct LexicalSearchRequest {
+    /// Terms already produced by the index analyzer; they are matched verbatim.
     pub words: Vec<String>,
+    /// Normalized x86 symbols matched against the symbol field.
     pub exact_symbols: Vec<String>,
+    /// Match complete symbols only, without expanding them into their components.
+    pub complete_symbols_only: bool,
     pub vendor: Option<Vendor>,
     pub document_id: Option<String>,
     pub kind: Option<ChunkKind>,
@@ -51,12 +55,10 @@ pub struct LexicalSearchRequest {
 }
 
 impl LexicalSearchRequest {
+    /// Free-text request: analyzed words plus shape-detected or uppercase symbols, which also
+    /// match their components.
     pub fn from_query(query: &str, limit: u32) -> Result<Self, IndexError> {
-        if !(1..=100).contains(&limit) {
-            return Err(IndexError::InvalidRequest(
-                "limit must be between 1 and 100".into(),
-            ));
-        }
+        validate_limit(limit)?;
         let words = tokenizer::query_words(query)?;
         let exact_symbols = tokenizer::exact_symbols(query);
         if words.is_empty() && exact_symbols.is_empty() {
@@ -67,11 +69,42 @@ impl LexicalSearchRequest {
         Ok(Self {
             words,
             exact_symbols,
+            complete_symbols_only: false,
             vendor: None,
             document_id: None,
             kind: None,
             limit,
         })
+    }
+
+    /// Exact-symbol request: every query token is a symbol and only complete symbols match.
+    pub fn exact_from_query(query: &str, limit: u32) -> Result<Self, IndexError> {
+        validate_limit(limit)?;
+        let exact_symbols = tokenizer::all_symbols(query);
+        if exact_symbols.is_empty() {
+            return Err(IndexError::InvalidRequest(
+                "query must contain a searchable symbol".into(),
+            ));
+        }
+        Ok(Self {
+            words: Vec::new(),
+            exact_symbols,
+            complete_symbols_only: true,
+            vendor: None,
+            document_id: None,
+            kind: None,
+            limit,
+        })
+    }
+}
+
+fn validate_limit(limit: u32) -> Result<(), IndexError> {
+    if (1..=100).contains(&limit) {
+        Ok(())
+    } else {
+        Err(IndexError::InvalidRequest(
+            "limit must be between 1 and 100".into(),
+        ))
     }
 }
 
@@ -147,6 +180,7 @@ mod tests {
 
     use super::{
         LexicalSearchRequest, LexicalSearcher, LexicalWriter, normalize_symbol, symbol_terms,
+        tokenizer::query_words,
     };
 
     fn chunk(
@@ -218,17 +252,27 @@ mod tests {
     }
 
     fn searcher() -> LexicalSearcher {
+        searcher_for(&fixture_chunks())
+    }
+
+    fn searcher_for(chunks: &[SearchChunk]) -> LexicalSearcher {
         let temporary = tempdir().unwrap();
         let path = temporary.path().join("lexical");
-        let stats = LexicalWriter::create(&path)
-            .unwrap()
-            .write(&fixture_chunks())
-            .unwrap();
-        assert_eq!(stats.document_count, 4);
+        let stats = LexicalWriter::create(&path).unwrap().write(chunks).unwrap();
+        assert_eq!(stats.document_count, chunks.len() as u64);
         assert!(!stats.component_checksum.is_empty());
         let searcher = LexicalSearcher::open(&path).unwrap();
         std::mem::forget(temporary);
         searcher
+    }
+
+    fn hit_ids(searcher: &LexicalSearcher, request: &LexicalSearchRequest) -> Vec<String> {
+        searcher
+            .search(request)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.chunk_id)
+            .collect()
     }
 
     #[test]
@@ -283,6 +327,156 @@ mod tests {
             .search(&LexicalSearchRequest::from_query("vendor:intel", 10).unwrap())
             .unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn words_are_analyzed_once_so_stems_match_the_index() {
+        let searcher = searcher_for(&[
+            chunk(
+                "chk:extension",
+                Vendor::Intel,
+                ChunkKind::Prose,
+                "Architecture",
+                "Processors support the extension mechanism.",
+                &[],
+            ),
+            chunk(
+                "chk:conversion",
+                Vendor::Amd,
+                ChunkKind::Prose,
+                "Arithmetic",
+                "The conversion rounds toward zero.",
+                &[],
+            ),
+        ]);
+        for (query, expected) in [
+            ("extension", "chk:extension"),
+            ("Extensions", "chk:extension"),
+            ("conversion", "chk:conversion"),
+        ] {
+            let request = LexicalSearchRequest::from_query(query, 10).unwrap();
+            assert_eq!(
+                hit_ids(&searcher, &request),
+                vec![expected],
+                "query {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn sentence_final_punctuation_does_not_hide_words() {
+        let searcher = searcher_for(&[chunk(
+            "chk:paging",
+            Vendor::Intel,
+            ChunkKind::Prose,
+            "Control registers",
+            "Set the PG flag in CR0 to enable paging. Then use an ampersand:",
+            &[],
+        )]);
+        for query in ["paging", "ampersand", "enable paging"] {
+            let request = LexicalSearchRequest::from_query(query, 10).unwrap();
+            assert_eq!(
+                hit_ids(&searcher, &request),
+                vec!["chk:paging"],
+                "query {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn tokens_keep_internal_x86_punctuation_only() {
+        for symbol in ["CPUID.07H.00H:EBX", "IA32_EFER", "CR0.PG", "EBX[5]", "#GP"] {
+            let alone = query_words(symbol).unwrap();
+            assert_eq!(alone.len(), 1, "{symbol} split into {alone:?}");
+            for suffix in [".", ":", ",", ").", "_"] {
+                assert_eq!(
+                    query_words(&format!("{symbol}{suffix}")).unwrap(),
+                    alone,
+                    "{symbol}{suffix}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_mode_matches_alphabetic_symbols_case_insensitively() {
+        let searcher = searcher_for(&[
+            chunk(
+                "chk:vmrun",
+                Vendor::Amd,
+                ChunkKind::Prose,
+                "VMRUN instruction",
+                "VMRUN starts a guest.",
+                &["VMRUN"],
+            ),
+            chunk(
+                "chk:other",
+                Vendor::Amd,
+                ChunkKind::Prose,
+                "Guest state",
+                "The guest state is saved.",
+                &["VMCB"],
+            ),
+        ]);
+        for query in ["VMRUN", "vmrun", "(VMRUN)"] {
+            let request = LexicalSearchRequest::exact_from_query(query, 10).unwrap();
+            assert!(request.words.is_empty());
+            assert_eq!(
+                hit_ids(&searcher, &request),
+                vec!["chk:vmrun"],
+                "query {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_mode_requires_the_complete_symbol() {
+        let mut chunks = fixture_chunks();
+        chunks.push(chunk(
+            "chk:parts",
+            Vendor::Intel,
+            ChunkKind::Prose,
+            "CPUID basics",
+            "CPUID returns feature flags in EBX.",
+            &["CPUID", "EBX"],
+        ));
+        let searcher = searcher_for(&chunks);
+        let exact = LexicalSearchRequest::exact_from_query("CPUID.07H.00H:EBX", 10).unwrap();
+        assert_eq!(hit_ids(&searcher, &exact), vec!["chk:vmx"]);
+
+        let lexical = LexicalSearchRequest::from_query("CPUID.07H.00H:EBX", 10).unwrap();
+        let lexical_hits = hit_ids(&searcher, &lexical);
+        assert_eq!(lexical_hits[0], "chk:vmx");
+        assert!(lexical_hits.iter().any(|id| id == "chk:parts"));
+    }
+
+    #[test]
+    fn free_text_symbols_are_shaped_or_uppercase_identifiers() {
+        let plain = LexicalSearchRequest::from_query("enable paging", 10).unwrap();
+        assert!(plain.exact_symbols.is_empty());
+        assert!(!plain.complete_symbols_only);
+
+        let mixed =
+            LexicalSearchRequest::from_query("VMRUN loads EFER, RFLAGS and cr4.vmxe", 10).unwrap();
+        assert_eq!(mixed.exact_symbols, ["VMRUN", "EFER", "RFLAGS", "CR4.VMXE"]);
+
+        let exact = LexicalSearchRequest::exact_from_query("enable paging", 10).unwrap();
+        assert_eq!(exact.exact_symbols, ["ENABLE", "PAGING"]);
+        assert!(exact.complete_symbols_only);
+    }
+
+    #[test]
+    fn uppercase_symbol_in_free_text_matches_symbol_field() {
+        let searcher = searcher_for(&[chunk(
+            "chk:vmrun",
+            Vendor::Amd,
+            ChunkKind::Prose,
+            "Secure virtual machine",
+            "Starts a guest.",
+            &["VMRUN"],
+        )]);
+        let request = LexicalSearchRequest::from_query("VMRUN", 10).unwrap();
+        assert_eq!(hit_ids(&searcher, &request), vec!["chk:vmrun"]);
     }
 }
 

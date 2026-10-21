@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 
 use schemars::JsonSchema;
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -28,11 +28,15 @@ pub enum TableError {
     Empty { block_id: String },
 }
 
-#[derive(Clone, Debug)]
-struct PendingSpan {
-    value: String,
-    remaining_rows: usize,
+/// One grid position covered by a source cell.
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    cell: usize,
+    first_column: bool,
 }
+
+/// The HTML specification's upper bound for `colspan`.
+const MAX_COLSPAN: usize = 1000;
 
 pub fn extract_table(block: &SourceBlock) -> Result<ExtractedTable, TableError> {
     if block.kind != BlockKind::Table {
@@ -40,7 +44,7 @@ pub fn extract_table(block: &SourceBlock) -> Result<ExtractedTable, TableError> 
             block_id: block.block_id.clone(),
         });
     }
-    let (headers, mut rows, mut warnings) = if block
+    let (mut headers, mut rows, mut warnings) = if block
         .raw_source
         .trim_start()
         .to_ascii_lowercase()
@@ -50,12 +54,12 @@ pub fn extract_table(block: &SourceBlock) -> Result<ExtractedTable, TableError> 
     } else {
         parse_markdown_table(&block.raw_source)
     };
-    if headers.is_empty() {
+    if headers.is_empty() && rows.iter().all(Vec::is_empty) {
         return Err(TableError::Empty {
             block_id: block.block_id.clone(),
         });
     }
-    normalize_widths(&headers, &mut rows, &mut warnings);
+    normalize_widths(&mut headers, &mut rows, &mut warnings);
     let identity = format!("{}\0{}", block.document_id, block.block_id);
     Ok(ExtractedTable {
         table_id: format!("tbl:{}", blake3::hash(identity.as_bytes()).to_hex()),
@@ -137,120 +141,127 @@ fn is_separator_row(row: &[String]) -> bool {
 }
 
 fn parse_html_table(raw: &str) -> (Vec<String>, Vec<Vec<String>>, Vec<ExtractionWarning>) {
-    static THEAD_ROWS: LazyLock<Selector> =
-        LazyLock::new(|| Selector::parse("thead tr").expect("valid selector"));
-    static TBODY_ROWS: LazyLock<Selector> =
-        LazyLock::new(|| Selector::parse("tbody tr").expect("valid selector"));
-    static ALL_ROWS: LazyLock<Selector> =
+    static ROWS: LazyLock<Selector> =
         LazyLock::new(|| Selector::parse("tr").expect("valid selector"));
-    static CELLS: LazyLock<Selector> =
-        LazyLock::new(|| Selector::parse("th, td").expect("valid selector"));
 
     let fragment = Html::parse_fragment(raw);
-    let header_rows = fragment.select(&THEAD_ROWS).collect::<Vec<_>>();
-    let headers = header_rows
-        .last()
-        .map(|row| expand_simple_row(row, &CELLS))
-        .unwrap_or_default();
-    let mut data_rows = fragment.select(&TBODY_ROWS).collect::<Vec<_>>();
-    if data_rows.is_empty() {
-        data_rows = fragment.select(&ALL_ROWS).collect();
-        if !header_rows.is_empty() {
-            data_rows.retain(|row| !row.value().name().eq_ignore_ascii_case("thead"));
-        } else if data_rows
-            .first()
-            .is_some_and(|row| row.select(&CELLS).any(|cell| cell.value().name() == "th"))
-        {
-            data_rows.remove(0);
-        }
-    }
-    let headers = if headers.is_empty() {
-        fragment
-            .select(&ALL_ROWS)
-            .find(|row| row.select(&CELLS).any(|cell| cell.value().name() == "th"))
-            .map(|row| expand_simple_row(&row, &CELLS))
-            .unwrap_or_default()
+    let rows = fragment.select(&ROWS).collect::<Vec<_>>();
+    let in_thead = |row: &ElementRef<'_>| {
+        row.ancestors()
+            .filter_map(ElementRef::wrap)
+            .any(|ancestor| ancestor.value().name().eq_ignore_ascii_case("thead"))
+    };
+    // Explicit `<thead>` rows are headers. Without them, leading rows made only
+    // of `<th>` cells are headers (the HTML parser wraps every row in `<tbody>`).
+    let header_count = if rows.iter().any(in_thead) {
+        rows.iter().take_while(|row| in_thead(row)).count()
     } else {
-        headers
+        rows.iter()
+            .take_while(|row| {
+                let mut cells = row_cells(row).peekable();
+                cells.peek().is_some() && cells.all(|cell| cell.value().name() == "th")
+            })
+            .count()
     };
 
-    let mut pending = Vec::<Option<PendingSpan>>::new();
-    let mut rows = Vec::with_capacity(data_rows.len());
-    for row in data_rows {
-        rows.push(expand_data_row(&row, &CELLS, &mut pending));
-    }
-    (headers, rows, Vec::new())
+    let (texts, grid) = build_grid(&rows, header_count);
+    let header_width = grid[..header_count].iter().map(Vec::len).max().unwrap_or(0);
+    let headers = (0..header_width)
+        .map(|column| header_label(&grid[..header_count], &texts, column))
+        .collect();
+    let data = grid[header_count..]
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|slot| match slot {
+                    Some(slot) if slot.first_column => texts[slot.cell].clone(),
+                    _ => String::new(),
+                })
+                .collect()
+        })
+        .collect();
+    (headers, data, Vec::new())
 }
 
-fn expand_simple_row(row: &scraper::ElementRef<'_>, cells: &Selector) -> Vec<String> {
-    let mut output = Vec::new();
-    for cell in row.select(cells) {
-        let colspan = span_value(&cell, "colspan");
-        output.push(cell_text(&cell));
-        output.extend((1..colspan).map(|_| String::new()));
-    }
-    output
+fn row_cells<'a>(row: &ElementRef<'a>) -> impl Iterator<Item = ElementRef<'a>> {
+    row.children().filter_map(ElementRef::wrap).filter(|cell| {
+        let name = cell.value().name();
+        name.eq_ignore_ascii_case("th") || name.eq_ignore_ascii_case("td")
+    })
 }
 
-fn expand_data_row(
-    row: &scraper::ElementRef<'_>,
-    cells: &Selector,
-    pending: &mut Vec<Option<PendingSpan>>,
-) -> Vec<String> {
-    let mut output = Vec::new();
-    let mut column = 0_usize;
-    for cell in row.select(cells) {
-        consume_pending(pending, &mut output, &mut column);
-        let colspan = span_value(&cell, "colspan");
-        let rowspan = span_value(&cell, "rowspan");
-        let value = cell_text(&cell);
-        for offset in 0..colspan {
-            let expanded = if offset == 0 {
-                value.clone()
-            } else {
-                String::new()
-            };
-            output.push(expanded.clone());
-            if rowspan > 1 {
-                if pending.len() <= column {
-                    pending.resize(column + 1, None);
-                }
-                pending[column] = Some(PendingSpan {
-                    value: expanded,
-                    remaining_rows: rowspan - 1,
-                });
+/// Places every cell on a row/column grid, honoring `rowspan` and `colspan`.
+/// Rowspan continuations repeat the cell; colspan continuations are marked so
+/// data rows keep one value per source cell. Header rowspans stop at the end
+/// of the header rows, as row groups bound them in HTML.
+fn build_grid(
+    rows: &[ElementRef<'_>],
+    header_count: usize,
+) -> (Vec<String>, Vec<Vec<Option<Slot>>>) {
+    let mut texts = Vec::new();
+    let mut grid = vec![Vec::<Option<Slot>>::new(); rows.len()];
+    for (row_index, row) in rows.iter().enumerate() {
+        let group_end = if row_index < header_count {
+            header_count
+        } else {
+            rows.len()
+        };
+        let mut column = 0_usize;
+        for cell in row_cells(row) {
+            while grid[row_index].get(column).is_some_and(Option::is_some) {
+                column += 1;
             }
-            column += 1;
+            let id = texts.len();
+            texts.push(cell_text(&cell));
+            let colspan = span_value(&cell, "colspan").min(MAX_COLSPAN);
+            let rowspan = span_value(&cell, "rowspan").min(group_end - row_index);
+            for target in &mut grid[row_index..row_index + rowspan] {
+                if target.len() < column + colspan {
+                    target.resize(column + colspan, None);
+                }
+                for offset in 0..colspan {
+                    target[column + offset].get_or_insert(Slot {
+                        cell: id,
+                        first_column: offset == 0,
+                    });
+                }
+            }
+            column += colspan;
         }
     }
-    consume_pending(pending, &mut output, &mut column);
-    output
+    (texts, grid)
 }
 
-fn consume_pending(
-    pending: &mut [Option<PendingSpan>],
-    output: &mut Vec<String>,
-    column: &mut usize,
-) {
-    while let Some(Some(span)) = pending.get_mut(*column) {
-        output.push(span.value.clone());
-        span.remaining_rows -= 1;
-        if span.remaining_rows == 0 {
-            pending[*column] = None;
+/// Joins the distinct non-empty header cells above a leaf column, e.g.
+/// `Typical / Address Size (bits)`.
+fn header_label(header_rows: &[Vec<Option<Slot>>], texts: &[String], column: usize) -> String {
+    let mut parts = Vec::<&str>::new();
+    let mut previous_cell = None;
+    for slot in header_rows
+        .iter()
+        .filter_map(|row| row.get(column).copied().flatten())
+    {
+        if previous_cell == Some(slot.cell) {
+            continue;
         }
-        *column += 1;
+        previous_cell = Some(slot.cell);
+        let text = texts[slot.cell].as_str();
+        if !text.is_empty() && parts.last() != Some(&text) {
+            parts.push(text);
+        }
     }
+    parts.join(" / ")
 }
 
-fn span_value(cell: &scraper::ElementRef<'_>, attribute: &str) -> usize {
+fn span_value(cell: &ElementRef<'_>, attribute: &str) -> usize {
     cell.value()
         .attr(attribute)
-        .and_then(|value| value.parse().ok())
+        .and_then(|value| value.trim().parse().ok())
         .filter(|value| *value > 0)
         .unwrap_or(1)
 }
 
-fn cell_text(cell: &scraper::ElementRef<'_>) -> String {
+fn cell_text(cell: &ElementRef<'_>) -> String {
     let html = cell
         .inner_html()
         .replace("<br>", " ")
@@ -261,23 +272,44 @@ fn cell_text(cell: &scraper::ElementRef<'_>) -> String {
     normalize_markdown(&text)
 }
 
+/// Gives every row exactly one value per column without dropping data: rows
+/// wider than the header extend it with unlabeled columns, shorter rows are
+/// padded with empty cells.
 fn normalize_widths(
-    headers: &[String],
+    headers: &mut Vec<String>,
     rows: &mut [Vec<String>],
     warnings: &mut Vec<ExtractionWarning>,
 ) {
+    let header_width = headers.len();
+    let width = rows
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
+        .max(header_width);
+    if width > header_width {
+        if header_width > 0 {
+            warnings.push(ExtractionWarning {
+                code: "table_header_extended".into(),
+                message: format!(
+                    "rows have up to {width} cells; header has {header_width}; added {} unlabeled header columns",
+                    width - header_width
+                ),
+            });
+        }
+        headers.resize(width, String::new());
+    }
     for (row_index, row) in rows.iter_mut().enumerate() {
-        if row.len() != headers.len() {
+        if row.len() < width {
             warnings.push(ExtractionWarning {
                 code: "table_width_mismatch".into(),
                 message: format!(
-                    "row {} has {} cells; header has {}",
+                    "row {} has {} cells; table has {width} columns",
                     row_index + 1,
-                    row.len(),
-                    headers.len()
+                    row.len()
                 ),
             });
-            row.resize(headers.len(), String::new());
+            row.resize(width, String::new());
         }
     }
 }
@@ -323,9 +355,84 @@ mod tests {
             "<table><thead><tr><th colspan=\"2\">Register</th></tr><tr><th>Bit(s)</th><th>Description</th></tr></thead><tbody><tr><td rowspan=\"2\">13</td><td>VMX<br>Enable</td></tr><tr><td>Lock</td></tr></tbody></table>\n",
         );
         let table = extract_table(&block).unwrap();
-        assert_eq!(table.headers, vec!["Bit(s)", "Description"]);
+        assert_eq!(
+            table.headers,
+            vec!["Register / Bit(s)", "Register / Description"]
+        );
         assert_eq!(table.rows[0], vec!["13", "VMX Enable"]);
         assert_eq!(table.rows[1], vec!["13", "Lock"]);
         assert!(table.warnings.is_empty());
+    }
+
+    #[test]
+    fn header_grid_keeps_rowspan_columns_from_earlier_header_rows() {
+        let block = table_block(
+            "<table><thead><tr><th colspan=\"2\">Mode</th><th rowspan=\"2\">OS</th><th colspan=\"2\">Typical</th></tr><tr><th>Long</th><th>Sub</th><th>Address</th><th>Operand</th></tr></thead><tbody><tr><td>Long Mode</td><td>64-Bit</td><td>64-bit OS</td><td>64</td><td>32</td></tr></tbody></table>\n",
+        );
+        let table = extract_table(&block).unwrap();
+        assert_eq!(
+            table.headers,
+            vec![
+                "Mode / Long",
+                "Mode / Sub",
+                "OS",
+                "Typical / Address",
+                "Typical / Operand"
+            ]
+        );
+        assert_eq!(
+            table.rows[0],
+            vec!["Long Mode", "64-Bit", "64-bit OS", "64", "32"]
+        );
+        assert!(table.warnings.is_empty());
+    }
+
+    #[test]
+    fn rows_wider_than_header_extend_it_instead_of_losing_cells() {
+        let block = table_block(
+            "<table><thead><tr><th>A</th><th>B</th></tr></thead><tbody><tr><td>1</td><td>2</td><td>3</td></tr></tbody></table>\n",
+        );
+        let table = extract_table(&block).unwrap();
+        assert_eq!(table.headers, vec!["A", "B", ""]);
+        assert_eq!(table.rows[0], vec!["1", "2", "3"]);
+        assert!(
+            table
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "table_header_extended")
+        );
+    }
+
+    #[test]
+    fn headerless_html_tables_are_kept() {
+        let block = table_block(
+            "<table><tr><td>JNO</td><td>Jump if not overflow.</td></tr><tr><td>JS</td><td>Jump if sign (negative).</td></tr></table>\n",
+        );
+        let table = extract_table(&block).unwrap();
+        assert_eq!(table.headers, vec!["", ""]);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[1], vec!["JS", "Jump if sign (negative)."]);
+        assert!(table.warnings.is_empty());
+    }
+
+    #[test]
+    fn inferred_header_row_is_not_repeated_as_data() {
+        let block = table_block(
+            "<table><tr><th>Legend</th><th>Description</th></tr><tr><td>Bits copied icon</td><td>Bits copied</td></tr></table>\n",
+        );
+        let table = extract_table(&block).unwrap();
+        assert_eq!(table.headers, vec!["Legend", "Description"]);
+        assert_eq!(
+            table.rows,
+            vec![vec![
+                "Bits copied icon".to_owned(),
+                "Bits copied".to_owned()
+            ]]
+        );
+    }
+
+    #[test]
+    fn tables_without_rows_are_rejected() {
+        assert!(extract_table(&table_block("<table></table>\n")).is_err());
     }
 }

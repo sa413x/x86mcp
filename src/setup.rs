@@ -10,7 +10,10 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::AppConfig;
+use crate::{
+    config::AppConfig,
+    snapshot::{IndexLock, Snapshot},
+};
 
 const BUNDLE_SCHEMA_VERSION: u32 = 1;
 const BUNDLE_METADATA: &str = "x86mcp-data.json";
@@ -46,10 +49,30 @@ pub struct DataInstallReport {
 }
 
 pub fn default_data_url() -> String {
-    format!("{RELEASE_BASE_URL}/v{PACKAGE_VERSION}/x86mcp-data-{PACKAGE_VERSION}.tar.zst")
+    release_data_url(option_env!("X86MCP_RELEASE_TAG"))
 }
 
-pub fn install_data(config: &AppConfig, options: &SetupOptions) -> Result<DataInstallReport> {
+/// The release workflow sets `X86MCP_RELEASE_TAG` to the exact Git tag it
+/// publishes; local builds fall back to the conventional `v<version>` tag.
+fn release_data_url(release_tag: Option<&str>) -> String {
+    let tag = match release_tag.map(str::trim) {
+        Some(tag) if !tag.is_empty() => tag.to_owned(),
+        _ => format!("v{PACKAGE_VERSION}"),
+    };
+    format!("{RELEASE_BASE_URL}/{tag}/x86mcp-data-{PACKAGE_VERSION}.tar.zst")
+}
+
+/// Installs the data bundle and runs `verify` against the installed data.
+///
+/// A replaced installation is kept as a backup until `verify` succeeds; if
+/// publishing or `verify` fails, the previous installation is restored.
+/// `verify` must close every file it opens under the data root before
+/// returning so a rollback can move the new files away.
+pub fn install_data<T>(
+    config: &AppConfig,
+    options: &SetupOptions,
+    verify: impl FnOnce() -> Result<T>,
+) -> Result<(DataInstallReport, T)> {
     fs::create_dir_all(&config.root)
         .with_context(|| format!("creating data directory {}", config.root.display()))?;
     let lock_path = config.root.join(".x86mcp-setup.lock");
@@ -63,25 +86,31 @@ pub fn install_data(config: &AppConfig, options: &SetupOptions) -> Result<DataIn
     lock.try_lock_exclusive()
         .context("another x86mcp setup is already running for this data directory")?;
 
-    let result = install_data_locked(config, options);
+    let result = install_data_locked(config, options, verify);
     let _ = FileExt::unlock(&lock);
     result
 }
 
-fn install_data_locked(config: &AppConfig, options: &SetupOptions) -> Result<DataInstallReport> {
+fn install_data_locked<T>(
+    config: &AppConfig,
+    options: &SetupOptions,
+    verify: impl FnOnce() -> Result<T>,
+) -> Result<(DataInstallReport, T)> {
     if !options.force
         && let Ok(manifest) = load_bundle_manifest(&config.root.join(BUNDLE_METADATA))
         && manifest.package_version == PACKAGE_VERSION
         && validate_installed_shape(&config.root, &manifest).is_ok()
     {
-        return Ok(DataInstallReport {
+        let verified = verify().context("verifying the existing data installation")?;
+        let report = DataInstallReport {
             installed: false,
             package_version: manifest.package_version,
             snapshot_id: manifest.snapshot_id,
             data_source: "existing installation".into(),
             archive_sha256: None,
             bytes_downloaded: 0,
-        });
+        };
+        return Ok((report, verified));
     }
 
     let source = options.data_source.clone().unwrap_or_else(default_data_url);
@@ -104,16 +133,49 @@ fn install_data_locked(config: &AppConfig, options: &SetupOptions) -> Result<Dat
     fs::create_dir(&payload).context("creating extracted data directory")?;
     extract_archive(&archive_path, &payload)?;
     let manifest = validate_bundle(&payload)?;
-    publish_payload(&config.root, &payload, staging.path())?;
+    validate_staged_snapshot(&payload, staging.path())?;
 
-    Ok(DataInstallReport {
+    // Index builds must not run while their directory is swapped out.
+    let _index_lock = IndexLock::acquire(&config.index_dir)
+        .context("waiting for running index builds to finish")?;
+    let backup = staging.path().join("backup");
+    fs::create_dir(&backup).context("creating setup rollback directory")?;
+    let mut publication = Publication::default();
+    let outcome = publish_payload(&config.root, &payload, &backup, &mut publication)
+        .and_then(|()| verify().context("verifying the installed data bundle"));
+    let verified = match outcome {
+        Ok(verified) => verified,
+        Err(error) => {
+            if let Err(rollback_error) = rollback_publish(&config.root, &backup, &publication) {
+                let kept = staging.keep().join("backup");
+                return Err(error.context(format!(
+                    "restoring the previous installation failed ({rollback_error}); its files are kept in {}",
+                    kept.display()
+                )));
+            }
+            return Err(error);
+        }
+    };
+
+    let report = DataInstallReport {
         installed: true,
         package_version: manifest.package_version,
         snapshot_id: manifest.snapshot_id,
         data_source: source,
         archive_sha256: Some(actual_sha256),
         bytes_downloaded,
-    })
+    };
+    Ok((report, verified))
+}
+
+/// Opens the staged snapshot exactly as `serve` would, with a throwaway
+/// snapshot cache, so a broken bundle never replaces a working installation.
+fn validate_staged_snapshot(payload: &Path, staging: &Path) -> Result<()> {
+    let snapshot = Snapshot::open(&payload.join("index"), &staging.join("snapshot-cache"))
+        .context("validating the data bundle snapshot")?;
+    // Close every staged file before the payload directories are moved.
+    drop(snapshot);
+    Ok(())
 }
 
 fn fetch_to_file(source: &str, destination: &Path) -> Result<(String, u64)> {
@@ -377,42 +439,48 @@ fn validate_installed_shape(root: &Path, manifest: &DataBundleManifest) -> Resul
     Ok(())
 }
 
-fn publish_payload(root: &Path, payload: &Path, staging: &Path) -> Result<()> {
-    let backup = staging.join("backup");
-    fs::create_dir(&backup).context("creating setup rollback directory")?;
-    let names = ["corpus", "index", BUNDLE_METADATA];
-    let mut backed_up = Vec::<&str>::new();
-    let mut installed = Vec::<&str>::new();
+/// Paths moved during publication, in the order they were moved.
+#[derive(Default)]
+struct Publication {
+    backed_up: Vec<&'static str>,
+    installed: Vec<&'static str>,
+}
 
-    for name in names {
+/// Moves the payload into `root`, moving any existing installation into
+/// `backup`. The backup is left in place for the caller to discard or restore.
+fn publish_payload(
+    root: &Path,
+    payload: &Path,
+    backup: &Path,
+    publication: &mut Publication,
+) -> Result<()> {
+    for name in ["corpus", "index", BUNDLE_METADATA] {
         let target = root.join(name);
         if target.exists() {
-            if let Err(error) = fs::rename(&target, backup.join(name)) {
-                rollback_publish(root, &backup, &installed, &backed_up);
-                return Err(error)
-                    .with_context(|| format!("moving existing {} aside", target.display()));
-            }
-            backed_up.push(name);
+            fs::rename(&target, backup.join(name))
+                .with_context(|| format!("moving existing {} aside", target.display()))?;
+            publication.backed_up.push(name);
         }
-
-        if let Err(error) = fs::rename(payload.join(name), &target) {
-            rollback_publish(root, &backup, &installed, &backed_up);
-            return Err(error).with_context(|| format!("publishing {}", target.display()));
-        }
-        installed.push(name);
+        fs::rename(payload.join(name), &target)
+            .with_context(|| format!("publishing {}", target.display()))?;
+        publication.installed.push(name);
     }
-
-    let _ = fs::remove_dir_all(backup);
     Ok(())
 }
 
-fn rollback_publish(root: &Path, backup: &Path, installed: &[&str], backed_up: &[&str]) {
-    for name in installed.iter().rev() {
-        let _ = remove_path(&root.join(name));
+fn rollback_publish(root: &Path, backup: &Path, publication: &Publication) -> std::io::Result<()> {
+    let mut first_error = None;
+    for name in publication.installed.iter().rev() {
+        if let Err(error) = remove_path(&root.join(name)) {
+            first_error.get_or_insert(error);
+        }
     }
-    for name in backed_up.iter().rev() {
-        let _ = fs::rename(backup.join(name), root.join(name));
+    for name in publication.backed_up.iter().rev() {
+        if let Err(error) = fs::rename(backup.join(name), root.join(name)) {
+            first_error.get_or_insert(error);
+        }
     }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn remove_path(path: &Path) -> std::io::Result<()> {
@@ -422,5 +490,28 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
         fs::remove_file(path)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_data_url_preserves_the_exact_release_tag() {
+        for tag in ["0.1.0", "v0.1.0", "x86mcp/0.1.0", "x86mcp-v0.1.0"] {
+            assert_eq!(
+                release_data_url(Some(tag)),
+                format!("{RELEASE_BASE_URL}/{tag}/x86mcp-data-{PACKAGE_VERSION}.tar.zst")
+            );
+        }
+    }
+
+    #[test]
+    fn release_data_url_falls_back_to_the_version_tag() {
+        let expected =
+            format!("{RELEASE_BASE_URL}/v{PACKAGE_VERSION}/x86mcp-data-{PACKAGE_VERSION}.tar.zst");
+        assert_eq!(release_data_url(None), expected);
+        assert_eq!(release_data_url(Some("")), expected);
     }
 }

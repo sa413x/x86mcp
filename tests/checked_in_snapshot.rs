@@ -7,7 +7,10 @@ use rmcp::{
     transport::{ConfigureCommandExt, TokioChildProcess},
 };
 use serde_json::json;
-use x86mcp::snapshot::{SNAPSHOT_SCHEMA_VERSION, SnapshotManifest};
+use x86mcp::{
+    corpus::CorpusManifest,
+    snapshot::{SNAPSHOT_SCHEMA_VERSION, SnapshotManifest},
+};
 
 #[tokio::test]
 async fn checked_in_snapshot_serves_lexical_mcp_without_model_artifacts() -> Result<()> {
@@ -18,7 +21,6 @@ async fn checked_in_snapshot_serves_lexical_mcp_without_model_artifacts() -> Res
     let generation = root.join("index/snapshots").join(&snapshot_id);
     let manifest = SnapshotManifest::load(&generation.join("snapshot.json"))?;
     assert_eq!(manifest.schema_version, SNAPSHOT_SCHEMA_VERSION);
-    assert_eq!(manifest.schema_version, 2);
     assert!(!generation.join("catalog.sqlite3").exists());
     assert!(!generation.join("vectors.f32").exists());
     for artifact in [&manifest.components.catalog, &manifest.components.vectors] {
@@ -60,9 +62,14 @@ async fn checked_in_snapshot_serves_lexical_mcp_without_model_artifacts() -> Res
             .iter()
             .all(|archive| archive["fresh"] == true)
     );
-    assert_eq!(status["counts"]["documents"], 15);
-    assert_eq!(status["counts"]["chunks"], 70_576);
-    assert_eq!(status["counts"]["diagrams"], 190);
+    let corpus = CorpusManifest::load(&root.join("corpus/manifest.toml"))?;
+    let corpus_documents: u32 = corpus
+        .archives
+        .iter()
+        .map(|archive| archive.entry_count)
+        .sum();
+    assert_eq!(status["counts"]["documents"], corpus_documents);
+    assert_eq!(status["counts"]["vectors"], status["counts"]["chunks"]);
 
     let outline = client
         .call_tool(
@@ -76,7 +83,10 @@ async fn checked_in_snapshot_serves_lexical_mcp_without_model_artifacts() -> Res
         .await?
         .structured_content
         .expect("structured outline output");
-    assert_eq!(outline["documents"].as_array().unwrap().len(), 15);
+    assert_eq!(
+        outline["documents"].as_array().unwrap().len(),
+        corpus_documents as usize
+    );
 
     let search = client
         .call_tool(

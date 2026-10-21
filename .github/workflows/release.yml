@@ -112,6 +112,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+      # x86mcp: bake the exact release tag into the binary's default data URL
+      # (src/setup.rs::default_data_url). Empty on pull requests.
+      X86MCP_RELEASE_TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - name: enable windows longpaths
         run: |

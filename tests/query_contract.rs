@@ -21,7 +21,7 @@ use x86mcp::{
         GetDiagramRequest, GetOutlineRequest, GetReferencesRequest, GetSectionRequest,
         GetTableRequest, LookupRequest, QueryEngine, SearchMode, SearchRequest,
     },
-    snapshot::{Snapshot, SnapshotBuilder, snapshot_status},
+    snapshot::{Snapshot, SnapshotBuilder, StatusMonitor},
 };
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
@@ -60,6 +60,35 @@ The AMD EFER register enables long mode and system-call extensions.
 ## SVM Operation
 
 SVM operation provides AMD virtualization. VMRUN enters a guest and VMEXIT returns to the host.
+"#;
+
+const TYPED: &str = r#"# Intel Typed Entity Manual
+
+## CVTSI2SD—Convert Doubleword Integer to Scalar Double Precision Floating-Point Value
+
+CVTSI2SD converts a signed doubleword integer to a double precision floating-point value.
+
+## IA32_EFER Extended Feature Enable Register
+
+IA32_EFER is a model-specific register that enables long mode. Software may execute CVTSI2SD regardless of IA32_EFER.
+
+## 26.2 VMX Controls
+
+The controls are listed in Table 26-1.
+
+| Bit | Meaning |
+| --- | --- |
+| 13 | VMXE, see Figure 26-1 |
+| 0 | Lock | Reserved |
+
+Table 26-1. VMX controls
+
+```mermaid
+graph TD
+  Root --> Guest
+```
+
+Figure 26-1. VMX state flow
 "#;
 
 #[test]
@@ -183,7 +212,7 @@ fn hybrid_search_ranks_more_than_256_unique_candidates() {
 
     let engine = QueryEngine::new(
         snapshot,
-        snapshot_status(&fixture.config),
+        StatusMonitor::new(&fixture.config),
         Some(Arc::new(|| Ok(Arc::new(FixtureEmbedder::new())))),
     )
     .unwrap();
@@ -377,6 +406,284 @@ fn typed_catalog_services_return_structured_current_snapshot_data() {
     assert_eq!(status.counts.documents, 2);
 }
 
+#[test]
+fn lookup_reports_exact_evidence_only_for_the_requested_kind() {
+    let fixture = Fixture::with_intel(TYPED);
+    let engine = fixture.engine(Arc::new(AtomicUsize::new(0)));
+    let lookup = |entity: &str, kind| {
+        engine
+            .lookup(LookupRequest {
+                entity: entity.into(),
+                kind,
+                vendors: vec![Vendor::Intel],
+                limit: 10,
+            })
+            .unwrap()
+    };
+    let in_section = |hit: &x86mcp::query::SearchHit, prefix: &str| {
+        hit.citation
+            .heading_path
+            .last()
+            .is_some_and(|heading| heading.starts_with(prefix))
+    };
+
+    let msr = lookup("IA32_EFER", EntityKind::Msr);
+    assert_eq!(msr.entity_state, EntityState::Found);
+    assert!(!msr.exact.is_empty());
+    assert!(
+        msr.exact
+            .iter()
+            .all(|hit| hit.snippet.contains("IA32_EFER"))
+    );
+
+    let wrong_kind = lookup("IA32_EFER", EntityKind::Instruction);
+    assert!(wrong_kind.exact.is_empty());
+    assert_eq!(wrong_kind.entity_state, EntityState::NotFound);
+    assert!(
+        wrong_kind
+            .related
+            .iter()
+            .any(|hit| in_section(hit, "IA32_EFER"))
+    );
+
+    let instruction = lookup("CVTSI2SD", EntityKind::Instruction);
+    assert_eq!(instruction.entity_state, EntityState::Found);
+    assert!(!instruction.exact.is_empty());
+    assert!(
+        instruction
+            .exact
+            .iter()
+            .all(|hit| in_section(hit, "CVTSI2SD"))
+    );
+    assert!(
+        instruction
+            .related
+            .iter()
+            .any(|hit| in_section(hit, "IA32_EFER"))
+    );
+}
+
+#[test]
+fn references_treat_table_and_diagram_ids_as_aliases_of_their_blocks() {
+    let fixture = Fixture::with_intel(TYPED);
+    let (table_id, table_block, diagram_id, diagram_block) = {
+        let snapshot = Snapshot::open(
+            &fixture.config.index_dir,
+            &fixture.config.snapshot_cache_dir,
+        )
+        .unwrap();
+        let intel = snapshot
+            .catalog
+            .documents()
+            .unwrap()
+            .into_iter()
+            .find(|document| document.meta.vendor == Vendor::Intel)
+            .unwrap();
+        let parsed = snapshot
+            .catalog
+            .parsed_document(&intel.meta.document_id)
+            .unwrap()
+            .unwrap();
+        (
+            parsed.tables[0].table_id.clone(),
+            parsed.tables[0].source_block_id.clone(),
+            parsed.diagrams[0].diagram_id.clone(),
+            parsed.diagrams[0].source_block_id.clone(),
+        )
+    };
+    let engine = fixture.engine(Arc::new(AtomicUsize::new(0)));
+    let references = |id: &str, direction| {
+        let response = engine
+            .get_references(GetReferencesRequest {
+                id: id.into(),
+                direction,
+                limit: 20,
+            })
+            .unwrap();
+        assert_eq!(response.entity_state, EntityState::Found);
+        response.references
+    };
+
+    let outgoing = references(&table_id, ReferenceDirection::Outgoing);
+    assert!(!outgoing.is_empty());
+    assert!(
+        outgoing
+            .iter()
+            .all(|reference| reference.record.source_block_id == table_block)
+    );
+    assert!(
+        outgoing
+            .iter()
+            .any(|reference| reference.record.target_id.as_deref() == Some(diagram_id.as_str()))
+    );
+
+    for (block, target) in [(&table_block, &table_id), (&diagram_block, &diagram_id)] {
+        let incoming = references(block, ReferenceDirection::Incoming);
+        assert!(
+            incoming
+                .iter()
+                .any(|reference| reference.record.target_id.as_deref() == Some(target.as_str())),
+            "incoming references to {block} miss {target}"
+        );
+    }
+
+    for reference in references(&table_id, ReferenceDirection::Incoming) {
+        assert_eq!(reference.citation.vendor, Vendor::Intel);
+        assert_eq!(reference.citation.document_id, reference.source_document_id);
+        assert_eq!(reference.citation.section_id, reference.source_section_id);
+        assert_eq!(reference.citation.entry_path, "intel.md");
+        assert!(!reference.citation.heading_path.is_empty());
+    }
+}
+
+#[test]
+fn outline_nodes_carry_source_citations() {
+    let fixture = Fixture::new();
+    let engine = fixture.engine(Arc::new(AtomicUsize::new(0)));
+    let documents = engine
+        .get_outline(GetOutlineRequest {
+            document_id: None,
+            root_section_id: None,
+            depth: 1,
+            limit: 20,
+            cursor: None,
+        })
+        .unwrap()
+        .documents;
+    for document in documents {
+        let outline = engine
+            .get_outline(GetOutlineRequest {
+                document_id: Some(document.meta.document_id.clone()),
+                root_section_id: None,
+                depth: 8,
+                limit: 100,
+                cursor: None,
+            })
+            .unwrap();
+        assert!(!outline.nodes.is_empty());
+        for node in outline.nodes {
+            assert_eq!(node.citation.vendor, document.meta.vendor);
+            assert_eq!(node.citation.document_id, document.meta.document_id);
+            assert_eq!(node.citation.entry_path, document.meta.entry_path);
+            assert_eq!(node.citation.section_id, node.section.section_id);
+            assert_eq!(node.citation.span, node.section.span);
+        }
+    }
+}
+
+#[test]
+fn table_pages_expose_persisted_extraction_warnings() {
+    let fixture = Fixture::with_intel(TYPED);
+    let table_id = {
+        let snapshot = Snapshot::open(
+            &fixture.config.index_dir,
+            &fixture.config.snapshot_cache_dir,
+        )
+        .unwrap();
+        let intel = snapshot
+            .catalog
+            .documents()
+            .unwrap()
+            .into_iter()
+            .find(|document| document.meta.vendor == Vendor::Intel)
+            .unwrap();
+        snapshot
+            .catalog
+            .parsed_document(&intel.meta.document_id)
+            .unwrap()
+            .unwrap()
+            .tables[0]
+            .table_id
+            .clone()
+    };
+    let engine = fixture.engine(Arc::new(AtomicUsize::new(0)));
+    for row_filter in [None, Some("Lock".to_owned())] {
+        let table = engine
+            .get_table(GetTableRequest {
+                id: table_id.clone(),
+                offset: 0,
+                limit: 10,
+                row_filter,
+                include_raw: false,
+            })
+            .unwrap()
+            .table
+            .unwrap();
+        assert!(
+            table
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "table_width_mismatch")
+        );
+    }
+}
+
+#[test]
+fn context_loads_more_than_256_combined_candidates() {
+    let fixture = Fixture::new();
+    let engine = fixture.engine(Arc::new(AtomicUsize::new(0)));
+    let missing = (0..256)
+        .map(|index| format!("chk:missing-{index}"))
+        .collect::<Vec<_>>();
+    let context = engine
+        .build_context(BuildContextRequest {
+            query: Some("VMX virtualization".into()),
+            chunk_ids: missing.clone(),
+            mode: SearchMode::Lexical,
+            vendors: Vec::new(),
+            token_budget: 4096,
+        })
+        .unwrap();
+    assert!(!context.items.is_empty());
+    let omitted = context
+        .omitted
+        .iter()
+        .map(|omission| omission.chunk_id.as_str())
+        .collect::<HashSet<_>>();
+    assert!(missing.iter().all(|id| omitted.contains(id.as_str())));
+}
+
+#[test]
+fn context_vendor_filter_applies_to_explicit_chunk_ids() {
+    let fixture = Fixture::new();
+    let engine = fixture.engine(Arc::new(AtomicUsize::new(0)));
+    let first_hit = |vendor| {
+        let mut request = search("virtualization operation", SearchMode::Lexical);
+        request.vendors = vec![vendor];
+        engine.search(request).unwrap().hits[0].chunk_id.clone()
+    };
+    let intel = first_hit(Vendor::Intel);
+    let amd = first_hit(Vendor::Amd);
+    let context = engine
+        .build_context(BuildContextRequest {
+            query: None,
+            chunk_ids: vec![intel.clone(), amd.clone()],
+            mode: SearchMode::Lexical,
+            vendors: vec![Vendor::Amd],
+            token_budget: 4096,
+        })
+        .unwrap();
+    let included = context
+        .items
+        .iter()
+        .flat_map(|item| item.chunk_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(included, vec![amd]);
+    assert!(
+        context
+            .items
+            .iter()
+            .flat_map(|item| &item.citations)
+            .all(|citation| citation.vendor == Vendor::Amd)
+    );
+    assert!(
+        context
+            .omitted
+            .iter()
+            .any(|omission| omission.chunk_id == intel)
+    );
+}
+
 fn search(query: &str, mode: SearchMode) -> SearchRequest {
     SearchRequest {
         query: query.into(),
@@ -433,7 +740,7 @@ impl Fixture {
     fn engine(&self, calls: Arc<AtomicUsize>) -> QueryEngine {
         let snapshot =
             Snapshot::open(&self.config.index_dir, &self.config.snapshot_cache_dir).unwrap();
-        let status = snapshot_status(&self.config);
+        let status = StatusMonitor::new(&self.config);
         let factory: EmbedderFactory = Arc::new(move || {
             calls.fetch_add(1, Ordering::Relaxed);
             Ok(Arc::new(FixtureEmbedder::new()))

@@ -87,15 +87,31 @@ pub struct SearchResponse {
     pub candidate_window_truncated: bool,
 }
 
+/// Entity kind for `x86_lookup`. Exact-symbol hits count as `exact` evidence only when the
+/// chunk names the entity and carries a kind-specific signal; other exact-symbol hits are
+/// reported as `related`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
+    /// Mnemonic (`CVTSI2SD`, `MOVSX/MOVSXD`) whose instruction-reference heading begins with
+    /// it (`MOV—Move`, `VMRUN Run Virtual Machine`).
     Instruction,
+    /// `IA32_*`/`MSR_*` names or hex addresses (`C000_0080h`, `0xC0000080`); other names
+    /// need a heading, line, or sentence that also mentions MSR or model-specific register.
     Msr,
+    /// `CPUID...`, `Fn...`, or hex leaf references in evidence that mentions CPUID; other
+    /// names need a heading, line, or sentence that also mentions CPUID.
     Cpuid,
+    /// Architectural register names (`CR4`, `DR7`, `XCR0`, `RFLAGS`, `EFER`, `RAX`, `XMM0`);
+    /// other names need a heading, line, or sentence that also mentions a register.
     Register,
+    /// Exception mnemonics (`#GP`, `#PF(0)`); other names need a heading, line, or sentence
+    /// that also mentions an exception, fault, trap, abort, or interrupt.
     Exception,
+    /// `REG.FIELD` or `REG[bits]` references (`CR4.VMXE`, `CR3[51:12]`); other names need a
+    /// heading, line, or sentence that also mentions a bit, flag, or field.
     Bitfield,
+    /// Lexical lookup only: every hit is `related`, and `found` means any hit exists.
     Term,
 }
 
@@ -118,10 +134,13 @@ pub struct LookupRequest {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct LookupResponse {
     pub state: RetrievalState,
+    /// `found` when kind-qualified exact evidence exists (any hit for `term`).
     pub entity_state: EntityState,
     pub entity: String,
     pub kind: EntityKind,
+    /// Exact-symbol hits that satisfy the requested kind.
     pub exact: Vec<SearchHit>,
+    /// Exact-symbol hits that fail the kind check, followed by lexical hits.
     pub related: Vec<SearchHit>,
     pub exact_truncated: bool,
     pub related_truncated: bool,
@@ -253,6 +272,8 @@ pub struct BuildContextRequest {
     pub chunk_ids: Vec<String>,
     #[serde(default)]
     pub mode: SearchMode,
+    /// Restricts both query results and explicit chunk IDs; excluded explicit IDs are
+    /// reported in `omitted`.
     #[serde(default)]
     pub vendors: Vec<Vendor>,
     pub token_budget: u32,

@@ -10,10 +10,10 @@ use thiserror::Error;
 
 use crate::{
     domain::{
-        Vendor, block::SourceBlock, chunk::ChunkKind, document::DocumentMeta,
+        Vendor, block::SourceBlock, chunk::ChunkKind, citation::Citation, document::DocumentMeta,
         reference::ReferenceRecord,
     },
-    ingest::{ExtractedDiagram, SectionNode},
+    ingest::{ExtractedDiagram, ExtractionWarning, SectionNode},
 };
 
 pub use reader::CatalogReader;
@@ -52,6 +52,8 @@ pub struct CatalogDocument {
 pub struct OutlineNode {
     pub section: SectionNode,
     pub relative_depth: u8,
+    /// Source citation for the section heading.
+    pub citation: Citation,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -72,6 +74,8 @@ pub struct TablePage {
     pub limit: u32,
     pub has_more: bool,
     pub raw_source: String,
+    /// Extraction warnings persisted for this table, such as `table_width_mismatch`.
+    pub warnings: Vec<ExtractionWarning>,
 }
 
 pub type DiagramData = ExtractedDiagram;
@@ -88,6 +92,8 @@ pub struct ResolvedReference {
     pub record: ReferenceRecord,
     pub source_document_id: String,
     pub source_section_id: String,
+    /// Source citation for the block that contains the reference.
+    pub citation: Citation,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]

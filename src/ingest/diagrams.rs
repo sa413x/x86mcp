@@ -85,33 +85,47 @@ pub fn extract_diagram(
         if line == "end" || line.starts_with("direction ") {
             continue;
         }
-        if let Some((left, style, label, right)) = parse_edge(line) {
-            let from = parse_endpoint(
-                left,
-                &mut nodes,
-                &mut node_positions,
-                &mut search_labels,
-                &mut warnings,
-                line_number + 1,
-            );
-            let to = parse_endpoint(
-                right,
-                &mut nodes,
-                &mut node_positions,
-                &mut search_labels,
-                &mut warnings,
-                line_number + 1,
-            );
-            if let Some(label) = &label {
-                push_unique(&mut search_labels, label);
-            }
-            if !from.is_empty() && !to.is_empty() {
-                edges.push(DiagramEdge {
-                    from,
-                    to,
-                    label,
-                    style,
-                });
+        if let Some(statement) = parse_edge_statement(line) {
+            let groups = statement
+                .groups
+                .iter()
+                .map(|group| {
+                    group
+                        .iter()
+                        .map(|endpoint| {
+                            parse_endpoint(
+                                endpoint,
+                                &mut nodes,
+                                &mut node_positions,
+                                &mut search_labels,
+                                &mut warnings,
+                                line_number + 1,
+                            )
+                        })
+                        .filter(|id| !id.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            for (position, link) in statement.links.into_iter().enumerate() {
+                if let Some(label) = &link.label {
+                    push_unique(&mut search_labels, label);
+                }
+                let reversed = link.style.starts_with('<') && !link.style.ends_with('>');
+                for left in &groups[position] {
+                    for right in &groups[position + 1] {
+                        let (from, to) = if reversed {
+                            (right, left)
+                        } else {
+                            (left, right)
+                        };
+                        edges.push(DiagramEdge {
+                            from: from.clone(),
+                            to: to.clone(),
+                            label: link.label.clone(),
+                            style: link.style.clone(),
+                        });
+                    }
+                }
             }
             continue;
         }
@@ -167,66 +181,208 @@ fn mermaid_body(raw: &str) -> &str {
         .trim_end()
 }
 
-fn parse_edge(line: &str) -> Option<(&str, String, Option<String>, &str)> {
-    static PIPE_LABELED: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"^(?P<left>.+?)\s*(?P<arrow><==>|<-->|<---|--->|-\.->|-->|==>|---|--[xX])\s*\|(?P<label>[^|]*)\|\s*(?P<right>.+)$",
-        )
-        .expect("Mermaid pipe-labeled edge regex must compile")
-    });
-    static LABELED: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r#"^(?P<left>.+?)\s*(?P<open>--|-\.)\s*(?:"(?P<quoted>[^"]+)"|(?P<plain>[^\-.][^>]*?))?\s*(?P<close>-->|\.->)\s*(?P<right>.+)$"#,
-        )
-        .expect("Mermaid labeled-edge regex must compile")
-    });
-    static SIMPLE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"^(?P<left>.+?)\s*(?P<arrow><==>|<-->|<---|--->|-\.->|-->|==>|---|--[xX])\s*(?P<right>.+)$",
-        )
-        .expect("Mermaid edge regex must compile")
-    });
-    if let Some(captures) = PIPE_LABELED.captures(line) {
-        let left = captures.name("left")?.as_str();
-        let right = captures.name("right")?.as_str();
-        let arrow = captures.name("arrow")?.as_str();
-        let label = captures
-            .name("label")
-            .map(|value| value.as_str().trim().to_owned())
-            .filter(|value| !value.is_empty());
-        return Some(orient_edge(left, arrow, label, right));
-    }
-    if let Some(captures) = LABELED.captures(line) {
-        let left = captures.name("left")?.as_str();
-        let right = captures.name("right")?.as_str();
-        let open = captures.name("open")?.as_str();
-        let close = captures.name("close")?.as_str();
-        let label = captures
-            .name("quoted")
-            .or_else(|| captures.name("plain"))
-            .map(|value| value.as_str().trim().to_owned())
-            .filter(|value| !value.is_empty());
-        return Some((left, format!("{open}{close}"), label, right));
-    }
-    SIMPLE.captures(line).and_then(|captures| {
-        let left = captures.name("left")?.as_str();
-        let right = captures.name("right")?.as_str();
-        let arrow = captures.name("arrow")?.as_str();
-        Some(orient_edge(left, arrow, None, right))
-    })
+/// A link between two endpoint groups, e.g. `-->`, `-- label -->`, `-.->|label|`.
+#[derive(Debug)]
+struct Link {
+    style: String,
+    label: Option<String>,
 }
 
-fn orient_edge<'a>(
-    left: &'a str,
-    style: &str,
-    label: Option<String>,
-    right: &'a str,
-) -> (&'a str, String, Option<String>, &'a str) {
-    if style.starts_with('<') && !style.ends_with('>') {
-        (right, style.to_owned(), label, left)
-    } else {
-        (left, style.to_owned(), label, right)
+/// An edge statement: endpoint groups (`A & B`) joined by links, possibly
+/// chained (`A --- B --- C`).
+#[derive(Debug)]
+struct EdgeStatement<'a> {
+    groups: Vec<Vec<&'a str>>,
+    links: Vec<Link>,
+}
+
+fn parse_edge_statement(line: &str) -> Option<EdgeStatement<'_>> {
+    // Unbalanced node shapes would hide every link; fall back to splitting on
+    // links anywhere so the malformed endpoint is reported and its labels kept.
+    let (segments, mut links) = split_links(line, true).or_else(|| split_links(line, false))?;
+    let last = segments.len() - 1;
+    let groups = segments
+        .iter()
+        .enumerate()
+        .map(|(position, &segment)| {
+            let mut endpoints = segment;
+            if position == last {
+                // State-diagram transitions carry their label after `:`.
+                if let [endpoint, label] = split_top_level(segment, ':')[..] {
+                    if let Some(label) = text_label(label) {
+                        links[last - 1].label.get_or_insert(label);
+                    }
+                    endpoints = endpoint;
+                }
+            }
+            split_top_level(endpoints, '&')
+        })
+        .collect();
+    Some(EdgeStatement { groups, links })
+}
+
+/// Splits a statement at every link outside node shapes and quotes. Returns
+/// `None` when there is no link or, with `track_shapes`, when brackets are
+/// unbalanced.
+fn split_links(line: &str, track_shapes: bool) -> Option<(Vec<&str>, Vec<Link>)> {
+    let mut segments = Vec::new();
+    let mut links = Vec::new();
+    let mut depth = 0_usize;
+    let mut quoted = false;
+    let mut segment_start = 0_usize;
+    let mut index = 0_usize;
+    while let Some(character) = line[index..].chars().next() {
+        if quoted {
+            quoted = character != '"';
+        } else if character == '"' && track_shapes {
+            quoted = true;
+        } else if matches!(character, '[' | '(' | '{') && track_shapes {
+            depth += 1;
+        } else if matches!(character, ']' | ')' | '}') && track_shapes {
+            depth = depth.checked_sub(1)?;
+        } else if depth == 0
+            && let Some((length, link)) = match_link(&line[index..])
+        {
+            segments.push(&line[segment_start..index]);
+            links.push(link);
+            index += length;
+            segment_start = index;
+            continue;
+        }
+        index += character.len_utf8();
     }
+    if links.is_empty() || depth != 0 || quoted {
+        return None;
+    }
+    segments.push(&line[segment_start..]);
+    Some((segments, links))
+}
+
+/// Splits on `separator` outside node shapes and quotes.
+fn split_top_level(value: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0_usize;
+    let mut quoted = false;
+    let mut start = 0_usize;
+    for (index, character) in value.char_indices() {
+        match character {
+            '"' => quoted = !quoted,
+            '[' | '(' | '{' if !quoted => depth += 1,
+            ']' | ')' | '}' if !quoted => depth = depth.saturating_sub(1),
+            _ if character == separator && !quoted && depth == 0 => {
+                parts.push(&value[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+/// Matches one Mermaid link at the start of `source`: `-->`, `---`, `==>`,
+/// `-.->`, `<-->`, `--x`, `~~~`, text-labelled forms (`-- text -->`,
+/// `== text ==>`, `-. text .->`) and a trailing `|label|`. Returns the
+/// consumed length.
+fn match_link(source: &str) -> Option<(usize, Link)> {
+    let bytes = source.as_bytes();
+    let start = usize::from(bytes.first() == Some(&b'<'));
+    let (mut end, style, mut label) = if source[start..].starts_with("~~~") {
+        let end = start + run_length(&bytes[start..], b'~');
+        (end, source[..end].to_owned(), None)
+    } else if source[start..].starts_with("-.") {
+        let dots = run_length(&bytes[start + 1..], b'.');
+        let after = start + 1 + dots;
+        if bytes.get(after) == Some(&b'-') {
+            let end = after + 1 + usize::from(bytes.get(after + 1) == Some(&b'>'));
+            (end, source[..end].to_owned(), None)
+        } else {
+            let (close_start, close_end) = find_close(source, after, b'.')?;
+            (
+                close_end,
+                format!("{}-{}", &source[..start], &source[close_start..close_end]),
+                text_label(&source[after..close_start]),
+            )
+        }
+    } else if source[start..].starts_with("--") || source[start..].starts_with("==") {
+        let stroke = bytes[start];
+        let after = start + run_length(&bytes[start..], stroke);
+        let terminates = |position: usize| {
+            bytes
+                .get(position)
+                .is_none_or(|byte| byte.is_ascii_whitespace())
+        };
+        match bytes.get(after) {
+            Some(b'>') => (after + 1, source[..after + 1].to_owned(), None),
+            Some(b'x' | b'X' | b'o') if terminates(after + 1) => {
+                (after + 1, source[..after + 1].to_owned(), None)
+            }
+            _ if after - start >= 3 => (after, source[..after].to_owned(), None),
+            _ => {
+                let (close_start, close_end) = find_close(source, after, stroke)?;
+                (
+                    close_end,
+                    format!("{}{}", &source[..start], &source[close_start..close_end]),
+                    text_label(&source[after..close_start]),
+                )
+            }
+        }
+    } else {
+        return None;
+    };
+    let after_arrow = end + run_length_by(&bytes[end..], |byte| byte == b' ');
+    if bytes.get(after_arrow) == Some(&b'|')
+        && let Some(close) = source[after_arrow + 1..].find('|')
+    {
+        label = text_label(&source[after_arrow + 1..after_arrow + 1 + close]);
+        end = after_arrow + close + 2;
+    }
+    Some((end, Link { style, label }))
+}
+
+/// Finds the closing half of a text-labelled link after `from`: `-->`/`---`
+/// for `--`, `==>`/`===` for `==`, `.->`/`.-` for `-.`.
+fn find_close(source: &str, from: usize, stroke: u8) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut position = from;
+    while position < bytes.len() {
+        if bytes[position] == b'"' {
+            position += 1 + source[position + 1..].find('"')? + 1;
+            continue;
+        }
+        if stroke == b'.' {
+            if bytes[position] == b'.' && bytes.get(position + 1) == Some(&b'-') {
+                let mut end = position + 1 + run_length(&bytes[position + 1..], b'-');
+                end += usize::from(bytes.get(end) == Some(&b'>'));
+                return Some((position, end));
+            }
+        } else if bytes[position] == stroke {
+            let run = run_length(&bytes[position..], stroke);
+            if bytes.get(position + run) == Some(&b'>') && run >= 2 {
+                return Some((position, position + run + 1));
+            }
+            if run >= 3 {
+                return Some((position, position + run));
+            }
+            position += run;
+            continue;
+        }
+        position += 1;
+    }
+    None
+}
+
+fn text_label(value: &str) -> Option<String> {
+    let label = value.trim().trim_matches('"').trim();
+    (!label.is_empty()).then(|| label.to_owned())
+}
+
+fn run_length(bytes: &[u8], expected: u8) -> usize {
+    run_length_by(bytes, |byte| byte == expected)
+}
+
+fn run_length_by(bytes: &[u8], predicate: impl Fn(u8) -> bool) -> usize {
+    bytes.iter().take_while(|byte| predicate(**byte)).count()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -259,13 +415,27 @@ fn parse_endpoint(
         collect_plain_labels(source, search_labels);
         return id;
     }
-    let (label, malformed) = parse_node_label(remainder, &id);
-    if malformed {
-        warnings.push(ExtractionWarning {
-            code: "malformed_mermaid_node".into(),
-            message: format!("line {line_number} has an unclosed node label for {id}"),
-        });
-    }
+    let label = match parse_node_label(remainder, &id) {
+        Some((label, malformed)) => {
+            if malformed {
+                warnings.push(ExtractionWarning {
+                    code: "malformed_mermaid_node".into(),
+                    message: format!("line {line_number} has an unclosed node label for {id}"),
+                });
+            }
+            label
+        }
+        None => {
+            warnings.push(ExtractionWarning {
+                code: "unknown_mermaid_syntax".into(),
+                message: format!(
+                    "line {line_number} has text after node {id} that was retained but not structurally parsed"
+                ),
+            });
+            collect_plain_labels(remainder, search_labels);
+            id.clone()
+        }
+    };
     push_unique(search_labels, &label);
     if let Some(position) = positions.get(&id).copied() {
         if nodes[position].label == nodes[position].id && label != id {
@@ -281,33 +451,36 @@ fn parse_endpoint(
     id
 }
 
-fn parse_node_label(remainder: &str, fallback: &str) -> (String, bool) {
+/// Parses the shape after a node id. `None` means the remainder is not a
+/// node shape; the flag reports an unclosed shape.
+fn parse_node_label(remainder: &str, fallback: &str) -> Option<(String, bool)> {
     if remainder.is_empty() {
-        return (fallback.to_owned(), false);
+        return Some((fallback.to_owned(), false));
     }
-    let opening = remainder.chars().next().unwrap_or_default();
-    if !matches!(opening, '[' | '(' | '{') {
-        return (fallback.to_owned(), false);
-    }
-    let closing = match opening {
-        '[' => ']',
+    let closing = match remainder.chars().next()? {
+        '[' | '>' => ']',
         '(' => ')',
         '{' => '}',
-        _ => unreachable!(),
+        _ => return None,
     };
     let closed = remainder.ends_with(closing);
     let value = remainder
-        .trim_matches(|character| matches!(character, '[' | ']' | '(' | ')' | '{' | '}' | '"'))
+        .trim_matches(|character| {
+            matches!(
+                character,
+                '[' | ']' | '(' | ')' | '{' | '}' | '>' | '"' | '/' | '\\'
+            )
+        })
         .trim();
     let label = value.split("-->").next().unwrap_or(value).trim();
-    (
+    Some((
         if label.is_empty() {
             fallback.to_owned()
         } else {
             label.to_owned()
         },
         !closed,
-    )
+    ))
 }
 
 fn parse_subgraph_label(value: &str) -> String {
@@ -493,5 +666,74 @@ mod tests {
         assert_eq!(diagram.raw_source, block.raw_source);
         assert!(diagram.search_labels.iter().any(|label| label == "Alpha"));
         assert!(!diagram.warnings.is_empty());
+    }
+
+    fn edge_triples(source: &str) -> Vec<(String, String, Option<String>)> {
+        extract_diagram(&diagram_block(source), None)
+            .unwrap()
+            .edges
+            .into_iter()
+            .map(|edge| (edge.from, edge.to, edge.label))
+            .collect()
+    }
+
+    fn triple(from: &str, to: &str, label: Option<&str>) -> (String, String, Option<String>) {
+        (from.into(), to.into(), label.map(str::to_owned))
+    }
+
+    #[test]
+    fn chained_edges_produce_every_link() {
+        let edges = edge_triples(
+            "```mermaid\ngraph LR\nA_OLD_TOP --- A_DATA --- A_NEW_TOP --- A_BASE\nB1[31 ... 24] --- B2[23 ... 16] -- low --> B3\n```\n",
+        );
+        assert_eq!(
+            edges,
+            vec![
+                triple("A_OLD_TOP", "A_DATA", None),
+                triple("A_DATA", "A_NEW_TOP", None),
+                triple("A_NEW_TOP", "A_BASE", None),
+                triple("B1", "B2", None),
+                triple("B2", "B3", Some("low")),
+            ]
+        );
+    }
+
+    #[test]
+    fn ampersand_groups_fan_out_across_links() {
+        let edges = edge_triples(
+            "```mermaid\ngraph TD\nPM_S & PM_EA --> PM_Seg\nLP0 & LP1 --- L12[\"L1 & L2\"] -->|QPI| X & Y\n```\n",
+        );
+        assert_eq!(
+            edges,
+            vec![
+                triple("PM_S", "PM_Seg", None),
+                triple("PM_EA", "PM_Seg", None),
+                triple("LP0", "L12", None),
+                triple("LP1", "L12", None),
+                triple("L12", "X", Some("QPI")),
+                triple("L12", "Y", Some("QPI")),
+            ]
+        );
+    }
+
+    #[test]
+    fn unparsed_endpoint_text_is_reported() {
+        let diagram = extract_diagram(
+            &diagram_block("```mermaid\ngraph TD\nA --> B extra\n```\n"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            diagram
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "unknown_mermaid_syntax")
+        );
+        assert!(
+            diagram
+                .edges
+                .iter()
+                .any(|edge| edge.from == "A" && edge.to == "B")
+        );
     }
 }

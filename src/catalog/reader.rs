@@ -13,6 +13,7 @@ use crate::{
         Vendor,
         block::{BlockKind, ContentClass, SourceBlock},
         chunk::{ChunkKind, SearchChunk},
+        citation::Citation,
         document::DocumentMeta,
         reference::{ReferenceKind, ReferenceRecord},
         source::SourceSpan,
@@ -99,6 +100,16 @@ impl CatalogReader {
             ));
         }
         let connection = self.connection.lock();
+        let Some((vendor, entry_path)) = connection
+            .query_row(
+                "SELECT vendor, entry_path FROM documents WHERE id=?1",
+                [document_id],
+                |row| Ok((vendor_cell(row, 0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(Vec::new());
+        };
         let mut statement = connection.prepare(
             "SELECT id, document_id, parent_id, heading, heading_path_json, level, ordinal, printed_page,
                     byte_start, byte_end, line_start, line_end
@@ -119,10 +130,19 @@ impl CatalogReader {
         let mut output = Vec::new();
         for section in &sections {
             let relative_depth = relative_depth(&section.section_id, root, &parents);
-            if relative_depth.is_some_and(|relative| relative <= depth) {
+            if let Some(relative_depth) = relative_depth.filter(|relative| *relative <= depth) {
                 output.push(OutlineNode {
                     section: section.clone(),
-                    relative_depth: relative_depth.unwrap(),
+                    relative_depth,
+                    citation: Citation {
+                        vendor,
+                        document_id: document_id.to_owned(),
+                        entry_path: entry_path.clone(),
+                        section_id: section.section_id.clone(),
+                        heading_path: section.heading_path.clone(),
+                        span: section.span.clone(),
+                        source_url: None,
+                    },
                 });
             }
         }
@@ -219,6 +239,7 @@ impl CatalogReader {
             )?
             .collect::<Result<Vec<_>, _>>()?;
         let total_rows = u32_from_i64(total_rows, 4, "table row count")?;
+        let warnings = table_warnings(&connection, &block_id)?;
         Ok(Some(TablePage {
             table_id,
             block_id,
@@ -230,6 +251,7 @@ impl CatalogReader {
             offset,
             limit,
             raw_source,
+            warnings,
         }))
     }
 
@@ -266,21 +288,39 @@ impl CatalogReader {
         limit: u32,
     ) -> Result<Vec<ResolvedReference>, CatalogError> {
         enforce_limit(limit, 201, "reference")?;
+        // Table and diagram IDs alias their containing block: references are
+        // extracted per source block but resolve to typed table/diagram targets.
         let sql = match direction {
             ReferenceDirection::Outgoing => {
                 "SELECT r.id, r.source_block_id, r.kind, r.label, r.normalized_key,
                         r.target_document_id, r.target_id, r.candidates_json, r.resolved,
-                        b.document_id, b.section_id
-                 FROM refs r JOIN blocks b ON b.id=r.source_block_id
+                        b.document_id, b.section_id, b.heading_path_json, b.printed_page,
+                        b.byte_start, b.byte_end, b.line_start, b.line_end,
+                        d.vendor, d.entry_path
+                 FROM refs r
+                 JOIN blocks b ON b.id=r.source_block_id
+                 JOIN documents d ON d.id=b.document_id
                  WHERE r.source_block_id=?1 OR b.section_id=?1 OR b.document_id=?1
+                    OR r.source_block_id IN (
+                        SELECT block_id FROM tables WHERE id=?1
+                        UNION SELECT block_id FROM diagrams WHERE id=?1
+                    )
                  ORDER BY r.id LIMIT ?2"
             }
             ReferenceDirection::Incoming => {
                 "SELECT r.id, r.source_block_id, r.kind, r.label, r.normalized_key,
                         r.target_document_id, r.target_id, r.candidates_json, r.resolved,
-                        b.document_id, b.section_id
-                 FROM refs r JOIN blocks b ON b.id=r.source_block_id
+                        b.document_id, b.section_id, b.heading_path_json, b.printed_page,
+                        b.byte_start, b.byte_end, b.line_start, b.line_end,
+                        d.vendor, d.entry_path
+                 FROM refs r
+                 JOIN blocks b ON b.id=r.source_block_id
+                 JOIN documents d ON d.id=b.document_id
                  WHERE r.target_id=?1 OR r.target_document_id=?1
+                    OR r.target_id IN (
+                        SELECT id FROM tables WHERE block_id=?1
+                        UNION SELECT id FROM diagrams WHERE block_id=?1
+                    )
                  ORDER BY r.id LIMIT ?2"
             }
         };
@@ -549,18 +589,7 @@ fn parsed_document_from_connection(
                 "table {table_id} row count mismatch"
             )));
         }
-        let warnings = {
-            let mut statement = connection
-                .prepare("SELECT code, message FROM warnings WHERE block_id=?1 ORDER BY id")?;
-            statement
-                .query_map([&block_id], |row| {
-                    Ok(ExtractionWarning {
-                        code: row.get(0)?,
-                        message: row.get(1)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
+        let warnings = table_warnings(connection, &block_id)?;
         tables.push(ExtractedTable {
             table_id,
             source_block_id: block_id,
@@ -598,15 +627,13 @@ fn parsed_document_from_connection(
     let references = {
         let mut statement = connection.prepare(
             "SELECT r.id, r.source_block_id, r.kind, r.label, r.normalized_key,
-                    r.target_document_id, r.target_id, r.candidates_json, r.resolved,
-                    b.document_id, b.section_id
+                    r.target_document_id, r.target_id, r.candidates_json, r.resolved
              FROM refs r JOIN blocks b ON b.id=r.source_block_id
              WHERE b.document_id=?1
              ORDER BY b.ordinal, instr(b.raw_text, r.label), r.id",
         )?;
         statement
-            .query_map([document_id], resolved_reference_from_row)?
-            .map(|result| result.map(|resolved| resolved.record))
+            .query_map([document_id], reference_record_from_row)?
             .collect::<Result<Vec<_>, _>>()?
     };
     let warnings = {
@@ -734,22 +761,65 @@ fn chunk_from_row_offset(row: &Row<'_>, offset: usize) -> rusqlite::Result<Searc
     })
 }
 
-fn resolved_reference_from_row(row: &Row<'_>) -> rusqlite::Result<ResolvedReference> {
-    Ok(ResolvedReference {
-        record: ReferenceRecord {
-            reference_id: row.get(0)?,
-            source_block_id: row.get(1)?,
-            kind: parse_reference_kind(&row.get::<_, String>(2)?, 2)?,
-            label: row.get(3)?,
-            normalized_key: row.get(4)?,
-            target_document_id: row.get(5)?,
-            target_id: row.get(6)?,
-            candidates: json_cell(row, 7)?,
-            resolved: row.get::<_, i64>(8)? != 0,
-        },
-        source_document_id: row.get(9)?,
-        source_section_id: row.get(10)?,
+fn reference_record_from_row(row: &Row<'_>) -> rusqlite::Result<ReferenceRecord> {
+    Ok(ReferenceRecord {
+        reference_id: row.get(0)?,
+        source_block_id: row.get(1)?,
+        kind: parse_reference_kind(&row.get::<_, String>(2)?, 2)?,
+        label: row.get(3)?,
+        normalized_key: row.get(4)?,
+        target_document_id: row.get(5)?,
+        target_id: row.get(6)?,
+        candidates: json_cell(row, 7)?,
+        resolved: row.get::<_, i64>(8)? != 0,
     })
+}
+
+fn resolved_reference_from_row(row: &Row<'_>) -> rusqlite::Result<ResolvedReference> {
+    let source_document_id: String = row.get(9)?;
+    let source_section_id: String = row.get(10)?;
+    let citation = Citation {
+        vendor: vendor_cell(row, 17)?,
+        document_id: source_document_id.clone(),
+        entry_path: row.get(18)?,
+        section_id: source_section_id.clone(),
+        heading_path: json_cell(row, 11)?,
+        span: SourceSpan {
+            printed_page: row.get(12)?,
+            byte_start: u64_from_i64(row.get(13)?, 13, "block byte_start")?,
+            byte_end: u64_from_i64(row.get(14)?, 14, "block byte_end")?,
+            line_start: u32_from_i64(row.get(15)?, 15, "block line_start")?,
+            line_end: u32_from_i64(row.get(16)?, 16, "block line_end")?,
+        },
+        source_url: None,
+    };
+    Ok(ResolvedReference {
+        record: reference_record_from_row(row)?,
+        source_document_id,
+        source_section_id,
+        citation,
+    })
+}
+
+fn table_warnings(
+    connection: &Connection,
+    block_id: &str,
+) -> Result<Vec<ExtractionWarning>, CatalogError> {
+    let mut statement =
+        connection.prepare("SELECT code, message FROM warnings WHERE block_id=?1 ORDER BY id")?;
+    Ok(statement
+        .query_map([block_id], |row| {
+            Ok(ExtractionWarning {
+                code: row.get(0)?,
+                message: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn vendor_cell(row: &Row<'_>, index: usize) -> rusqlite::Result<Vendor> {
+    let text: String = row.get(index)?;
+    Vendor::from_str(&text).map_err(|error| conversion_error(index, error.to_owned()))
 }
 
 fn relative_depth<'a>(

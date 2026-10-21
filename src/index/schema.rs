@@ -3,7 +3,7 @@ use tantivy::schema::{
 };
 
 use super::tokenizer::X86_TOKENIZER;
-pub(crate) const LEXICAL_SCHEMA_VERSION: u32 = 1;
+pub(crate) const LEXICAL_SCHEMA_VERSION: u32 = 2;
 
 pub(crate) const FIELD_CHUNK_ID: &str = "chunk_id";
 pub(crate) const FIELD_VENDOR: &str = "vendor";

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::index::LexicalSearchRequest;
 
-use super::{QueryError, SearchRequest};
+use super::{QueryError, SearchMode, SearchRequest};
 
 const MAX_CURSOR_OFFSET: u32 = 10_000;
 const MAX_FILTER_VALUES: usize = 16;
@@ -51,7 +51,12 @@ pub(crate) fn plan_search(
         ));
     }
     let fetch_limit = 100;
-    let lexical = LexicalSearchRequest::from_query(&request.query, fetch_limit)?;
+    let lexical = match request.mode {
+        SearchMode::Exact => LexicalSearchRequest::exact_from_query(&request.query, fetch_limit)?,
+        SearchMode::Lexical | SearchMode::Semantic | SearchMode::Hybrid => {
+            LexicalSearchRequest::from_query(&request.query, fetch_limit)?
+        }
+    };
     Ok(SearchPlan {
         lexical,
         request_hash,
@@ -187,7 +192,7 @@ fn decode_cursor(
 
 #[cfg(test)]
 mod tests {
-    use crate::{domain::Vendor, domain::chunk::ChunkKind, query::SearchMode};
+    use crate::{domain::Vendor, domain::chunk::ChunkKind};
 
     use super::*;
 
@@ -221,5 +226,22 @@ mod tests {
             plan_search(&stale, "snapshot-b"),
             Err(QueryError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn only_exact_mode_treats_every_token_as_a_symbol() {
+        let mut hybrid = request();
+        hybrid.query = "enable paging".into();
+        let plan = plan_search(&hybrid, "snapshot-a").unwrap();
+        assert!(plan.lexical.exact_symbols.is_empty());
+        assert!(!plan.lexical.complete_symbols_only);
+        assert!(!plan.lexical.words.is_empty());
+
+        let mut exact = hybrid;
+        exact.mode = SearchMode::Exact;
+        exact.query = "vmrun".into();
+        let plan = plan_search(&exact, "snapshot-a").unwrap();
+        assert_eq!(plan.lexical.exact_symbols, ["VMRUN"]);
+        assert!(plan.lexical.complete_symbols_only);
     }
 }

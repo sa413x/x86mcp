@@ -63,6 +63,14 @@ pub enum CorpusError {
         entry_path: String,
         bytes: u64,
     },
+    #[error(
+        "archive {archive_id} entry {entry_path} inflates beyond its declared size of {declared_bytes} bytes"
+    )]
+    EntryOverflow {
+        archive_id: String,
+        entry_path: String,
+        declared_bytes: u64,
+    },
     #[error("archive {archive_id} entry {entry_path} is not UTF-8: {source}")]
     InvalidUtf8 {
         archive_id: String,
