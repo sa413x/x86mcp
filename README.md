@@ -6,7 +6,7 @@ The server does not read PDFs. Its input is a set of ZIP archives containing `.m
 
 ## Install
 
-Linux and macOS:
+macOS and Linux:
 
 ```bash
 CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"; curl --proto '=https' --tlsv1.2 -LsSf https://github.com/sa413x/x86mcp/releases/latest/download/x86mcp-installer.sh | sh && "$CARGO_HOME/bin/x86mcp" setup
@@ -18,11 +18,23 @@ Windows PowerShell:
 irm https://github.com/sa413x/x86mcp/releases/latest/download/x86mcp-installer.ps1 | iex; & "$(if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$HOME\.cargo" })\bin\x86mcp.exe" setup
 ```
 
+On macOS, run the command in Terminal. Release binaries are published for Apple silicon (`aarch64-apple-darwin`) and Intel Macs (`x86_64-apple-darwin`), and the installer picks the right one.
+
 The command installs a native binary, downloads the matching Intel and AMD data bundle, verifies its SHA-256 checksum, and prepares the embedding model. The data goes into the current user's local application data directory. Running `x86mcp setup` again is safe; use `x86mcp setup --force` to replace the installed bundle. A replacement bundle is fully validated before the previous installation is discarded; if validation fails, the previous installation is restored.
+
+| OS | Installed data (`setup`) | Model and snapshot caches |
+| --- | --- | --- |
+| macOS | `~/Library/Application Support/x86mcp` | `~/Library/Caches/dev.x86mcp.x86mcp` |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/x86mcp` | `${XDG_CACHE_HOME:-~/.cache}/x86mcp` |
+| Windows | `%LOCALAPPDATA%\x86mcp` | `%LOCALAPPDATA%\x86mcp\x86mcp\cache` |
 
 ## Build from source
 
-You need a stable Rust toolchain with edition 2024 support.
+You need a stable Rust toolchain with edition 2024 support and a C compiler for the bundled SQLite, zstd, and Oniguruma sources. On macOS, install the Xcode Command Line Tools first:
+
+```bash
+xcode-select --install
+```
 
 ```bash
 cargo build --release
@@ -62,7 +74,28 @@ Set `FASTEMBED_CACHE_DIR` to move the model cache. Set `X86MCP_SNAPSHOT_CACHE_DI
 
 ## MCP client setup
 
-After installation and `x86mcp setup`, point the client at the installed binary. No `--root` argument is needed for the default user installation.
+After installation and `x86mcp setup`, point the client at the installed binary. No `--root` argument is needed for the default user installation. MCP client configs do not expand `~` or `$HOME`, so `command` must be an absolute path.
+
+macOS (on Linux the path is usually `/home/you/.cargo/bin/x86mcp`):
+
+```json
+{
+  "mcpServers": {
+    "x86": {
+      "command": "/Users/you/.cargo/bin/x86mcp",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+Claude Desktop on macOS reads this from `~/Library/Application Support/Claude/claude_desktop_config.json`. Claude Code can register the server for all projects directly:
+
+```bash
+claude mcp add --scope user x86 -- "$HOME/.cargo/bin/x86mcp" serve
+```
+
+Windows:
 
 ```json
 {
@@ -75,7 +108,7 @@ After installation and `x86mcp setup`, point the client at the installed binary.
 }
 ```
 
-For a source checkout or custom data directory, add `["--root", "C:\\path\\to\\x86mcp", "serve"]`. Call `x86_index_status` before retrieval when corpus freshness matters; it re-checks archive freshness and model files on every call, and every retrieval response carries the current `stale` flag.
+For a source checkout or custom data directory, add `--root` before `serve`, for example `["--root", "/Users/you/src/x86mcp", "serve"]` on macOS or `["--root", "C:\\path\\to\\x86mcp", "serve"]` on Windows. Call `x86_index_status` before retrieval when corpus freshness matters; it re-checks archive freshness and model files on every call, and every retrieval response carries the current `stale` flag.
 
 ## Tools
 
