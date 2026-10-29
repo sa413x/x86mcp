@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "snapshot_id": "e10b1471fca14d3dfd57b633f7a2bf76ea01584b8d191edd866204d3281b10c1",
-  "created_unix_seconds": 1792621388,
-  "build_version": "0.2.0",
+  "snapshot_id": "1936b3b414a1da550c017f1569946861f166292f0a2b249e8ec2c3143af151e8",
+  "created_unix_seconds": 1793280828,
+  "build_version": "0.3.0",
   "ingest_schema_version": 3,
   "corpus_manifest_blake3": "b87cb1bb70e115ca8e437617312e2a46d1867b468b31d1572f45b65b5e131b77",
   "archives": [
@@ -135,7 +135,7 @@
   "vector_format_version": 1,
   "vector_count": 72729,
   "vector_dimension": 384,
-  "vector_payload_blake3": "ad405101d713921d98a29184126b43492f19b1d55424dd93c79bd77898cbde5c",
+  "vector_payload_blake3": "cadab2697023b26399292f6d49e575c322d26a5d5d38f644ccc019c38bf71962",
   "model": {
     "code": "intfloat/multilingual-e5-small",
     "dimension": 384,
@@ -180,24 +180,24 @@
   "components": {
     "catalog": {
       "raw_bytes": 322977792,
-      "raw_blake3": "b3b5212aaea1bfeb5aa047befbb435e802e26bba26834362bae9e1959a041a1f",
+      "raw_blake3": "e96113ac2e0113d9c5ec10114ae9a306138909b2e12709de4130d13660fd6083",
       "parts": [
         {
           "path": "catalog.sqlite3.zst",
-          "compressed_bytes": 37203802,
-          "compressed_blake3": "d3d8b775f9d0be0830251c96ba443b5494d6694c3edde94d722940ac74d236b5"
+          "compressed_bytes": 37203798,
+          "compressed_blake3": "910e58a07fab0c842d1fbc8adebda14b68b92d626db502def15e33047f70d6de"
         }
       ]
     },
-    "lexical_blake3": "9eb907485d3a975b9bd70cfc0fc24ce8cd088dc8961a26481501ad4cbd0c7e9a",
+    "lexical_blake3": "f8da60ba1c01c8089285cd1ec22e9b90c17db54ea510df78d4aa7d1cda1cf865",
     "vectors": {
       "raw_bytes": 111711808,
-      "raw_blake3": "bed6be83580045bbc5f9fbb0c1914af03487b07c7e64ad41d02a213f5bada504",
+      "raw_blake3": "d57e117eaf0ad127803cba4ebee97b32b5dda2b7c491360e2a9dba3eb0ef4c93",
       "parts": [
         {
           "path": "vectors.f32.zst",
           "compressed_bytes": 95906401,
-          "compressed_blake3": "3769f8c5a6bbf91efe9f50a5961408399c9a57703a3289f33c9e0be976d447c5"
+          "compressed_blake3": "8bbc644cefad0bd109b461ec18fa78e129833e65d673e600ec34cbfcbfd69966"
         }
       ]
     }
