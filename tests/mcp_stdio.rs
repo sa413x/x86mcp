@@ -6,11 +6,15 @@ use std::{
 
 use anyhow::Result;
 use rmcp::{
-    ServiceExt,
-    model::CallToolRequestParams,
+    RoleClient, ServiceError, ServiceExt,
+    model::{
+        CallToolRequestParams, ErrorCode, GetPromptRequestParams, JsonObject,
+        ReadResourceRequestParams,
+    },
+    service::RunningService,
     transport::{ConfigureCommandExt, TokioChildProcess},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use x86mcp::{
     config::AppConfig,
@@ -34,18 +38,256 @@ const TOOL_NAMES: [&str; 10] = [
     "x86_lookup",
     "x86_search",
 ];
+const PROMPT_NAMES: [&str; 4] = [
+    "compare_vendors",
+    "describe_register",
+    "explain_instruction",
+    "research",
+];
+const STATUS_URI: &str = "x86://index/status";
+
+type Client = RunningService<RoleClient, ()>;
+
+/// Spawns `x86mcp serve` on `root` with model and snapshot caches under `caches`.
+async fn serve(root: &Path, caches: &Path) -> Result<Client> {
+    let transport = TokioChildProcess::new(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_x86mcp")).configure(|command| {
+            command
+                .arg("--root")
+                .arg(root)
+                .arg("serve")
+                .env("FASTEMBED_CACHE_DIR", caches.join("models"))
+                .env("X86MCP_SNAPSHOT_CACHE_DIR", caches.join("snapshots"));
+        }),
+    )?;
+    Ok(().serve(transport).await?)
+}
+
+fn arguments(value: Value) -> JsonObject {
+    value.as_object().unwrap().clone()
+}
+
+async fn call(client: &Client, tool: &'static str, arguments: Value) -> Result<Value> {
+    let mut request = CallToolRequestParams::new(tool);
+    if let Value::Object(arguments) = arguments {
+        request = request.with_arguments(arguments);
+    }
+    Ok(client
+        .call_tool(request)
+        .await?
+        .structured_content
+        .expect("structured tool output"))
+}
+
+async fn read_text(client: &Client, uri: &str) -> Result<String> {
+    let result = client
+        .read_resource(ReadResourceRequestParams::new(uri))
+        .await?;
+    Ok(serde_json::to_value(result)?["contents"][0]["text"]
+        .as_str()
+        .expect("text resource")
+        .to_owned())
+}
+
+async fn prompt_text(client: &Client, name: &str, arguments: Value) -> Result<String> {
+    let result = client
+        .get_prompt(GetPromptRequestParams::new(name).with_arguments(self::arguments(arguments)))
+        .await?;
+    Ok(
+        serde_json::to_value(result)?["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("text prompt message")
+            .to_owned(),
+    )
+}
+
+fn error_code(error: ServiceError) -> ErrorCode {
+    match error {
+        ServiceError::McpError(error) => error.code,
+        other => panic!("expected an MCP error, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn stdio_server_starts_without_data_and_picks_up_a_later_install() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let caches = tempfile::tempdir()?;
+    let client = serve(root.path(), caches.path()).await?;
+
+    let mut tools = client.list_all_tools().await?;
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>(),
+        TOOL_NAMES
+    );
+    let mut prompts = client.list_all_prompts().await?;
+    prompts.sort_by(|left, right| left.name.cmp(&right.name));
+    assert_eq!(
+        prompts
+            .iter()
+            .map(|prompt| prompt.name.as_str())
+            .collect::<Vec<_>>(),
+        PROMPT_NAMES
+    );
+    let resources = client.list_all_resources().await?;
+    assert_eq!(
+        resources
+            .iter()
+            .map(|resource| resource.uri.as_str())
+            .collect::<Vec<_>>(),
+        [STATUS_URI]
+    );
+    let templates = client.list_all_resource_templates().await?;
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].uri_template, "x86://sections/{id}");
+
+    let status = call(&client, "x86_index_status", Value::Null).await?;
+    assert_eq!(status["status"]["state"], "missing");
+    assert!(status["manifest"].is_null());
+    assert!(status["counts"].is_null());
+    let status: Value = serde_json::from_str(&read_text(&client, STATUS_URI).await?)?;
+    assert_eq!(status["status"]["state"], "missing");
+
+    let search = json!({"query": "VMX", "mode": "lexical", "limit": 5});
+    let error = client
+        .call_tool(
+            CallToolRequestParams::new("x86_search").with_arguments(arguments(search.clone())),
+        )
+        .await
+        .expect_err("retrieval needs an installed index");
+    assert!(error.to_string().contains("x86mcp setup"));
+
+    build_fixture(root.path());
+    let hits = call(&client, "x86_search", search).await?;
+    assert!(!hits["hits"].as_array().unwrap().is_empty());
+    assert_eq!(client.list_all_resources().await?.len(), 3);
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_server_reads_manual_resources() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let caches = tempfile::tempdir()?;
+    build_fixture(root.path());
+    let client = serve(root.path(), caches.path()).await?;
+
+    let resources = client.list_all_resources().await?;
+    let documents = resources
+        .iter()
+        .filter(|resource| resource.uri.starts_with("x86://documents/doc:"))
+        .collect::<Vec<_>>();
+    assert_eq!(documents.len(), 2);
+    let intel = documents
+        .iter()
+        .find(|resource| resource.name == "intel")
+        .expect("intel manual resource");
+    let outline = read_text(&client, &intel.uri).await?;
+    assert!(outline.contains("- Intel Manual (`sec:"));
+
+    let hits = call(
+        &client,
+        "x86_search",
+        json!({"query": "VMX", "mode": "lexical", "limit": 5}),
+    )
+    .await?;
+    let section_id = hits["hits"][0]["citation"]["section_id"].as_str().unwrap();
+    // URI template clients percent-encode the ':' inside section IDs.
+    let encoded = format!("x86://sections/{}", section_id.replace(':', "%3A"));
+    let section = read_text(&client, &encoded).await?;
+    assert!(section.contains("CR4.VMXE enables virtual-machine extensions."));
+    assert_eq!(
+        read_text(&client, &format!("x86://sections/{section_id}")).await?,
+        section
+    );
+
+    let status: Value = serde_json::from_str(&read_text(&client, STATUS_URI).await?)?;
+    assert_eq!(status["counts"]["documents"], 2);
+
+    for uri in [
+        "x86://sections/sec:unknown",
+        "x86://sections/%zz",
+        "x86://tables/tbl:1",
+    ] {
+        let error = client
+            .read_resource(ReadResourceRequestParams::new(uri))
+            .await
+            .expect_err("unknown resources are errors");
+        assert_eq!(error_code(error), ErrorCode::RESOURCE_NOT_FOUND, "{uri}");
+    }
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_server_prompts_validate_and_scope_arguments() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let caches = tempfile::tempdir()?;
+    let client = serve(root.path(), caches.path()).await?;
+
+    let prompts = client.list_all_prompts().await?;
+    let explain = prompts
+        .iter()
+        .find(|prompt| prompt.name == "explain_instruction")
+        .unwrap();
+    let required = explain
+        .arguments
+        .iter()
+        .flatten()
+        .map(|argument| (argument.name.as_str(), argument.required))
+        .collect::<Vec<_>>();
+    assert!(required.contains(&("mnemonic", Some(true))));
+    assert!(required.contains(&("vendor", Some(false))));
+
+    let amd = prompt_text(
+        &client,
+        "explain_instruction",
+        json!({"mnemonic": " VMRUN ", "vendor": "AMD"}),
+    )
+    .await?;
+    assert!(amd.contains(r#""entity":"VMRUN""#));
+    assert!(amd.contains(r#""vendors":["amd"]"#));
+    // Clients send unfilled optional arguments as empty strings.
+    let both = prompt_text(
+        &client,
+        "explain_instruction",
+        json!({"mnemonic": "VMRUN", "vendor": ""}),
+    )
+    .await?;
+    assert!(!both.contains(r#""vendors""#));
+
+    for (name, arguments) in [
+        (
+            "explain_instruction",
+            json!({"mnemonic": "VMRUN", "vendor": "arm"}),
+        ),
+        ("explain_instruction", json!({"mnemonic": "  "})),
+        ("describe_register", json!({})),
+    ] {
+        let error = client
+            .get_prompt(
+                GetPromptRequestParams::new(name).with_arguments(self::arguments(arguments)),
+            )
+            .await
+            .expect_err("invalid prompt arguments are errors");
+        assert_eq!(error_code(error), ErrorCode::INVALID_PARAMS, "{name}");
+    }
+
+    client.cancel().await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn stdio_server_lists_ten_typed_tools_and_serves_structured_results() -> Result<()> {
     let temporary = tempfile::tempdir()?;
+    let caches = tempfile::tempdir()?;
     build_fixture(temporary.path());
-
-    let transport = TokioChildProcess::new(
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_x86mcp")).configure(|command| {
-            command.arg("--root").arg(temporary.path()).arg("serve");
-        }),
-    )?;
-    let client = ().serve(transport).await?;
+    let client = serve(temporary.path(), caches.path()).await?;
 
     let mut tools = client.list_all_tools().await?;
     tools.sort_by(|left, right| left.name.cmp(&right.name));

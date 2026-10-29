@@ -402,8 +402,8 @@ fn typed_catalog_services_return_structured_current_snapshot_data() {
     assert!(!references.references.is_empty());
 
     let status = engine.index_status();
-    assert_eq!(status.manifest.snapshot_id, fixture.snapshot_id);
-    assert_eq!(status.counts.documents, 2);
+    assert_eq!(status.manifest.unwrap().snapshot_id, fixture.snapshot_id);
+    assert_eq!(status.counts.unwrap().documents, 2);
 }
 
 #[test]

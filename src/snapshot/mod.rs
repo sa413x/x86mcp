@@ -116,7 +116,7 @@ pub struct SnapshotStatus {
 }
 
 impl SnapshotStatus {
-    fn unusable(state: SnapshotState, reason: String) -> Self {
+    pub(crate) fn unusable(state: SnapshotState, reason: String) -> Self {
         Self {
             state,
             snapshot_id: None,

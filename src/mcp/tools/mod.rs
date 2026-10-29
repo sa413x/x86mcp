@@ -10,10 +10,9 @@ mod lookup;
 mod search;
 
 use rmcp::{
-    ErrorData, ServerHandler,
+    ErrorData,
     handler::server::wrapper::{Json, Parameters},
-    model::{Implementation, ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router,
+    tool, tool_router,
 };
 
 use crate::query::{
@@ -26,7 +25,7 @@ use crate::query::{
 
 use super::server::X86McpServer;
 
-#[tool_router]
+#[tool_router(vis = "pub(crate)")]
 impl X86McpServer {
     #[tool(
         name = "x86_search",
@@ -183,7 +182,7 @@ impl X86McpServer {
 
     #[tool(
         name = "x86_index_status",
-        description = "Report current snapshot identity, readiness, staleness or model degradation reasons, per-archive checksum freshness, model contract, component checksums, and indexed entity counts.",
+        description = "Report current snapshot identity, readiness, staleness or model degradation reasons, per-archive checksum freshness, model contract, component checksums, and indexed entity counts. Works before any data is installed: state is then missing or invalid, reasons say why, and manifest and counts are null.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -193,19 +192,5 @@ impl X86McpServer {
     )]
     async fn x86_index_status(&self) -> Result<Json<IndexStatusResponse>, ErrorData> {
         index_status::invoke(self).await.map(Json)
-    }
-}
-
-#[tool_handler]
-impl ServerHandler for X86McpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(
-                Implementation::new("x86mcp", env!("CARGO_PKG_VERSION"))
-                    .with_title("x86 Architecture Manuals"),
-            )
-            .with_instructions(
-                "Use x86_index_status before retrieval when freshness matters. Prefer x86_lookup for named architectural entities, x86_search for open-ended evidence, and x86_build_context for bounded prompts. Preserve returned citations and disclose stale or semantic_degraded_reason state.",
-            )
     }
 }

@@ -78,8 +78,8 @@ impl QueryEngine {
     pub fn index_status(&self) -> IndexStatusResponse {
         IndexStatusResponse {
             status: self.status.evaluate(&self.snapshot.manifest),
-            counts: self.snapshot.manifest.counts.clone(),
-            manifest: self.snapshot.manifest.clone(),
+            counts: Some(self.snapshot.manifest.counts.clone()),
+            manifest: Some(self.snapshot.manifest.clone()),
         }
     }
 

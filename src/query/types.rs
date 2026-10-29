@@ -304,8 +304,10 @@ pub struct BuildContextResponse {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct IndexStatusResponse {
     pub status: SnapshotStatus,
-    pub manifest: SnapshotManifest,
-    pub counts: CatalogCounts,
+    /// `None` while no usable snapshot is installed (`status.state` is `missing` or `invalid`).
+    pub manifest: Option<SnapshotManifest>,
+    /// `None` while no usable snapshot is installed.
+    pub counts: Option<CatalogCounts>,
 }
 
 fn default_true() -> bool {
